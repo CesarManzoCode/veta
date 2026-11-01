@@ -6,6 +6,7 @@
 
 - Workspace de Cargo con los siete crates del grafo de §2 y `Cargo.lock` sin dependencias externas.
 - `veta-core`: tipos, valores con orden total, mapa de validez, vectores y chunks, errores con código de salida, xxh64, CRC32C (SSE4.2 y tabla), CRC-32, HyperLogLog p = 12, PRNG determinista, fechas, decimales, formato TSV, estadísticas, filtros de escaneo y contador de memoria. Implementado; sin verificar todavía.
+- `veta-parquet`: decodificadores (PLAIN, RLE/bit-packing híbrido, diccionario, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT) y lector `ParquetFile` de esquemas planos con páginas v1/v2, diccionario, CRC, Snappy, iterador de chunks de 8192 filas y estadísticas por grupo de filas. Implementado; sin verificar todavía.
 - Binario `veta`: reconoce los subcomandos de §13 y responde `unsupported: <subcomando>` (exit 1).
 
 ### K0 — fundación (2026-11-01)
