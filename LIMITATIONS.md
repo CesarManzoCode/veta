@@ -1,0 +1,30 @@
+# Límites
+
+Fuente única de lo que veta no demuestra. Ningún otro archivo repite estos límites.
+
+## Alcance del producto
+
+- Un solo nodo y un solo proceso por consulta. No hay clústeres, replicación, Keeper/Zookeeper, servidor de red ni concurrencia de producción.
+- No demuestra Terraform, Ansible, Kubernetes, AWS ni operación de clústeres, que pide la vacante.
+- No hay particiones: todas las partes pertenecen a una partición única.
+- No hay `INSERT`, `UPDATE` ni `DELETE` en SQL; los datos entran con `veta load` desde Parquet o TSV.
+- No hay derrame a disco: una consulta que pasa el límite de memoria falla con exit 4.
+- El SQL es el subconjunto que exigen las 65 consultas de ClickBench y TPC-H (sin `UNION`, ventanas, `INTERVAL`, tipos anidados ni funciones fuera de esa lista).
+- Las cadenas son bytes: `length` y `substring` cuentan bytes, no caracteres.
+- `Timestamp` tiene resolución de segundos.
+- Parquet: sin tipos anidados ni REPEATED, sin INT96, sin cifrado, sin bloom filters ni page index; compresión solo UNCOMPRESSED y SNAPPY (no ZSTD, GZIP, LZ4, LZ4_RAW ni BROTLI), así que no lee los Parquet por omisión de ClickHouse (zstd).
+
+## Alcance de la evidencia
+
+- Todas las mediciones son de una máquina (Ryzen 5 5600G, 6 núcleos, 14 GiB visibles) y no se comparan con resultados publicados de ClickBench.
+- Sin root no se vacía la caché de páginas: todos los tiempos son en caliente.
+- El tiempo de veta es reloj de pared del proceso (incluye arranque); el de ClickHouse y DuckDB es el que reporta cada uno. La comparación es conservadora contra veta, pero no es la misma medida.
+- ClickBench usa 10 de 100 archivos (10 M filas); TPC-H llega a SF10. No se prueba a escala de `hits` completo ni de petabytes.
+- En el subconjunto, ClickBench Q20 y Q42 devuelven 0 filas en ambos oráculos, así que esas dos solo prueban el resultado vacío.
+- ClickBench Q4 y Q29 se comparan contra una reescritura en un oráculo (ClickHouse desborda `AVG` en Int64; DuckDB no hace coincidir `.` con `\n`); veta corre el texto original.
+- En los empates del borde de `LIMIT` se comparan las claves de orden, no las demás columnas de esas filas.
+- La estimación de cardinalidad se mide con TPC-H, cuyos datos son uniformes e independientes, y con una suite sintética de NULL; no con datos correlacionados como el Join Order Benchmark.
+- `kill -9` deja la caché de páginas intacta: los cortes no prueban pérdida de energía, aunque el protocolo hace `fsync`.
+- DELTA_BYTE_ARRAY no la escribe ningún oráculo: su lectura se prueba con dos archivos de `apache/parquet-testing` y su escritura con lo que leen DuckDB y ClickHouse.
+- El catálogo de mutantes tiene seis fallas plantadas; que todas mueran no prueba que el arnés detecte cualquier falla.
+- La afirmación de que el proyecto es más difícil que otros proyectos de César no tiene criterio automático.
