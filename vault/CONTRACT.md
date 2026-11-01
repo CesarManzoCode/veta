@@ -101,9 +101,11 @@ Filas ordenadas por la clave primaria (orden no único, como ClickHouse; sin cla
 | `primary.idx` | un bloque (§5.3) por columna de la clave con `granules + 1` valores: el valor en la primera fila de cada gránulo y, al final, el de la última fila de la parte |
 | `c<N>.bin` | un bloque por gránulo, en orden |
 | `c<N>.mrk` | `granules + 1` desplazamientos `u64` LE en `c<N>.bin`; el último es la longitud del archivo |
-| `stats.bin` | por columna: `rows u64`, `nulls u64`, `has_minmax u8`, `min`, `max` (codificación de valor), registros HLL (p = 12, 4096 bytes); después un HLL por cada prefijo de la clave primaria (longitudes 1..k) |
+| `stats.bin` | por columna: `rows u64`, `nulls u64`, `has_minmax u8`, `min`, `max` (codificación de valor), registros HLL (p = 12, 4096 bytes); `has_minmax = 0` si no hay valores no nulos o si es una cadena cuyo mín o máx pasa de 256 bytes; después un HLL por cada prefijo de la clave primaria (longitudes 1..k) |
 | `sample.bin` | muestra sistemática de `s = min(1024, rows)` filas (posiciones `floor(i·rows/s)`), un bloque por columna |
 | `checksums.txt` | `<archivo>\t<bytes>\t<crc32c hex>` por cada otro archivo de la parte; última línea `self\t<crc32c de las líneas anteriores>` |
+
+Codificación de valor (en `stats.bin`): la representación física de §4 en little-endian (`i128` en 16 bytes, booleano en 1 byte); cadenas como `u32` LE de longitud + bytes. `stats.bin` termina con su propio `u32` CRC32C. Todos los enteros de los archivos binarios son little-endian.
 
 `owner.lock` solo existe en directorios `tmp_*` y no se incluye en `checksums.txt`.
 
@@ -192,7 +194,7 @@ Implementación propia de Thrift compacto (`thrift-compact-protocol.md`, Thrift 
 
 ### 10.1 Sentencias
 
-- `CREATE TABLE nombre (col tipo [NOT NULL | NULL], …, [PRIMARY KEY (cols)]) [ENGINE = ident] [ORDER BY (cols)] [SETTINGS k = v, …]`. `ORDER BY` equivale a `PRIMARY KEY`; `ENGINE` y `SETTINGS` se aceptan y se ignoran. Sin `NOT NULL` la columna es nullable. Así se aceptan sin cambios `create.sql` de ClickBench para ClickHouse y `bench/tpch/create.sql`.
+- `CREATE [OR REPLACE] TABLE nombre (col tipo [NOT NULL | NULL], …, [PRIMARY KEY (cols)]) [ENGINE = ident] [ORDER BY (cols)] [SETTINGS k = literal, …]`. `ORDER BY` equivale a `PRIMARY KEY`; `ENGINE` y `SETTINGS` se aceptan y se ignoran; `OR REPLACE` borra la tabla si existe. Un `CREATE TABLE` sin `OR REPLACE` sobre una tabla existente es error 1. Sin `NOT NULL` la columna es nullable. Así se aceptan sin cambios `create.sql` de ClickBench para ClickHouse y `bench/tpch/create.sql`.
 - `SELECT …` (con `WITH`).
 - `EXPLAIN [ANALYZE] SELECT …` (equivale a `--explain-analyze` cuando lleva ANALYZE).
 - Comentarios `-- …` y `/* … */`. Identificadores sin distinguir mayúsculas; las columnas de salida conservan el texto escrito.
@@ -328,12 +330,13 @@ $VETA_DATA/runs/<comando>/   $VETA_DATA/scratch/
 
 - Imprimen progreso y terminan con **una** línea `RESULT <nombre> <PASS|FAIL|SKIP> <resumen>`.
 - Salida: 0 PASS; 1 FAIL; 77 SKIP porque falta `$VETA_DATA/bin/duckdb`, `$VETA_DATA/bin/clickhouse` o `lz4` (solo `fetch` descarga; ningún otro comando descarga); 2 error de uso o de infraestructura (falta el binario de veta, faltan datos sin cargar).
-- Escriben `$VETA_DATA/runs/<nombre>/report.json` = `{"command", "status", "summary", "items": [...]}` y las salidas crudas de cada motor en `$VETA_DATA/runs/<nombre>/raw/`.
+- Escriben `$VETA_DATA/runs/<nombre>/report.json` = `{"command", "status", "summary", "items": [...]}` más los campos de §17.1, y la salida cruda (stdout sin tocar) de cada ejecución de un motor en `$VETA_DATA/runs/<nombre>/raw/<motor>/<item>.out`, con `<motor>` ∈ `veta`, `duckdb`, `clickhouse` e `<item>` = `q01`…`q43` en los bancos. Cada corrida de un comando reemplaza su directorio `runs/<nombre>/`.
+- Sus bases temporales viven en `$VETA_DATA/scratch/<nombre>/`.
 
 ### 14.3 Carga de datos
 
 - `fetch`: descarga y verifica todo el apéndice A (idempotente: no vuelve a bajar lo que ya verifica).
-- `load clickbench [--rebuild-veta]`: veta: `sql` con `create-clickhouse.sql` y `load --parquet hits_0..9` (10 partes); DuckDB: `create-duckdb.sql` + `INSERT INTO hits SELECT * REPLACE (make_date(EventDate) AS EventDate, epoch_ms(EventTime * 1000) AS EventTime, epoch_ms(ClientEventTime * 1000) AS ClientEventTime, epoch_ms(LocalEventTime * 1000) AS LocalEventTime) FROM read_parquet([...], binary_as_string=True)`; ClickHouse: `create-clickhouse.sql`, `INSERT INTO hits SELECT * FROM file('<ruta>/hits_{0..9}.parquet', Parquet)`, `OPTIMIZE TABLE hits FINAL`. `--rebuild-veta` rehace solo la base de veta.
+- `load clickbench [--rebuild-veta]` (en ClickHouse, base `default`): veta: `sql` con `create-clickhouse.sql` y `load --parquet hits_0..9` (10 partes); DuckDB: `create-duckdb.sql` + `INSERT INTO hits SELECT * REPLACE (make_date(EventDate) AS EventDate, epoch_ms(EventTime * 1000) AS EventTime, epoch_ms(ClientEventTime * 1000) AS ClientEventTime, epoch_ms(LocalEventTime * 1000) AS LocalEventTime) FROM read_parquet([...], binary_as_string=True)`; ClickHouse: `create-clickhouse.sql`, `INSERT INTO hits SELECT * FROM file('<ruta>/hits_{0..9}.parquet', Parquet)`, `OPTIMIZE TABLE hits FINAL`. `--rebuild-veta` rehace solo la base de veta.
 - `load tpch --sf 1|10 [--rebuild-veta]`: DuckDB genera en `tpch/sf<N>.duckdb` con `SET memory_limit='4GB'; LOAD tpch; CALL dbgen(sf=N)` y exporta cada tabla con `COPY t TO 'tpch/sf<N>/t.parquet' (FORMAT parquet)`; veta: `bench/tpch/create.sql` y `load --parquet … --batch-rows 1000000`; ClickHouse: base `tpch_sf<N>`, `bench/tpch/create.sql` con ` ENGINE = MergeTree` añadido a cada tabla e `INSERT … SELECT * FROM file(…, Parquet)`.
 - `bench/tpch/create.sql`: las 8 tablas con los tipos de `schema.sql` de DuckDB y estas claves primarias: lineitem `(l_orderkey, l_linenumber)`, orders `(o_orderkey)`, customer `(c_custkey)`, part `(p_partkey)`, partsupp `(ps_partkey, ps_suppkey)`, supplier `(s_suppkey)`, nation `(n_nationkey)`, region `(r_regionkey)`.
 
@@ -414,7 +417,7 @@ Todos siguen §14.2. `<N>/<M> equal` es el formato de resumen de las comparacion
 | `crash-merge [--iterations N]` | `kill -9` en fusión | por iteración: copia prístina de `hits_0` en 20 lotes, `merge --final` muerto con SIGKILL en un instante uniforme en `[0, T]` (T = duración medida de una fusión completa), `recover`; sin `tmp_*`, `check` con 0, las 5 consultas iguales a la referencia; ≥ 80 % de los cortes con el proceso todavía vivo |
 | `crash-insert [--iterations N]` | `kill -9` en inserción | tabla `(batch_id BIGINT, i BIGINT, payload VARCHAR, PRIMARY KEY (batch_id, i))`, un `load --tsv` de 200 000 filas por iteración muerto en `[0, T]`; tras `recover`, cada `batch_id` presente tiene exactamente 200 000 filas, sin `tmp_*`, `check` con 0; ≥ 80 % de cortes con el proceso vivo |
 | `corruption` | detección de partes corruptas | para `part.txt`, `primary.idx`, `c<N>.bin`, `c<N>.mrk`, `stats.bin`, `sample.bin`, `checksums.txt`: sobre una copia de una tabla de 4 partes se cambia un byte; una consulta que lee esa columna termina con 3 o devuelve exactamente el resultado sin esa parte; la siguiente devuelve el resultado sin esa parte; la parte está en `detached/` |
-| `parquet-read-duckdb` | DuckDB escribe, veta lee | por cada configuración (v1 por omisión, v1 sin diccionario, v2, v2 sin diccionario; con `COMPRESSION uncompressed` y `snappy`; columnas de `hits` y de `lineitem` SF1, con columnas nullable) más los dos archivos de parquet-testing (DELTA_BYTE_ARRAY): `parquet_metadata` confirma las codificaciones y `SELECT *` de veta = de DuckDB; cubiertas PLAIN, PLAIN_DICTIONARY, RLE_DICTIONARY, RLE, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY y BYTE_STREAM_SPLIT |
+| `parquet-read-duckdb` | DuckDB escribe, veta lee | por cada configuración (v1 por omisión, v1 sin diccionario, v2, v2 sin diccionario; con `COMPRESSION uncompressed` y `snappy`; columnas de `hits` y de `lineitem` SF1, más columnas derivadas nullable con NULL y una `DOUBLE` como `CAST(l_extendedprice AS DOUBLE)`) más los dos archivos de parquet-testing (DELTA_BYTE_ARRAY): `parquet_metadata` confirma las codificaciones y `SELECT *` de veta = de DuckDB; cubiertas PLAIN, PLAIN_DICTIONARY, RLE_DICTIONARY, RLE, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY y BYTE_STREAM_SPLIT. DuckDB no lista RLE en `encodings` (solo la codificación de los datos): RLE cuenta como cubierta si algún chunk tiene `stats_null_count > 0`, porque sus niveles de definición van en RLE/bit-packing |
 | `parquet-read-hits` | lee los `hits_N` publicados | por archivo, `count(*)`, `sum` de cada columna numérica y `sum(length(s))` de cada cadena = DuckDB |
 | `parquet-write-duckdb` | veta escribe, DuckDB lee | `hits` (`dict`+`snappy` y `delta`+`none`) y las 8 tablas SF1 (las 4 codificaciones × 2 compresiones): `EXCEPT ALL` en ambos sentidos contra la tabla de DuckDB = 0 filas |
 | `parquet-write-clickhouse` | ClickHouse lee lo de veta | los mismos archivos con `file(…, Parquet)` y `EXCEPT ALL` contra la tabla de ClickHouse = 0 filas |
@@ -428,6 +431,34 @@ Todos siguen §14.2. `<N>/<M> equal` es el formato de resumen de las comparacion
 La suite de NULL de `cardinality`: tablas generadas `na(k BIGINT, v BIGINT)` con 200 000 filas y 90 % de `k` NULL, `nb(k BIGINT, w BIGINT)` con 20 000 filas y `k` único no nulo; 10 consultas `SELECT count(*) FROM na JOIN nb ON na.k = nb.k [WHERE …]` con filtros variados.
 
 TLP y el oráculo de optimizador usan el mismo generador (`gen.py`, semilla fija): 3 tablas con columnas `BIGINT`, `INTEGER`, `DECIMAL(10,2)`, `VARCHAR` (alfabeto corto), `DATE` y `BOOLEAN`, 0–2000 filas, 0–50 % de NULL por columna, cargadas por TSV en varios lotes; consultas con `WHERE`, joins internos y `LEFT JOIN` con predicados en `ON` y en `WHERE` sobre el lado que aporta NULL, `DISTINCT`, `GROUP BY` y agregados `COUNT/SUM/MIN/MAX` (sin `AVG`, sin `SUM` sobre `DOUBLE`), y `ORDER BY` total con `LIMIT`. TLP compara la consulta con la unión de sus particiones `p`, `NOT p` y `p IS NULL` (agregados recompuestos: COUNT y SUM suman, MIN/MAX de MIN/MAX).
+
+### 17.1 Campos de `report.json`
+
+| Comando | Campos (además de `command`, `status`, `summary`, `items`) |
+|---|---|
+| `clickbench-verify-*`, `tpch-verify-*` | cada item: `query` (`q01`…), `rule` (`multiset`, `ordered`, `limit-border`, `limit-unordered`), `verdict` (`equal`/`different`/`error`), `rows` (objeto por motor), `reason` |
+| `pruning` | cada item: `query`, `granules_read_prune`, `granules_read_noprune`, `verdict` |
+| `tpch-verify-*` | además, `scale_factor` |
+| `tlp`, `optimizer-oracle` | `counts`: `{queries, discrepancies, errors}`; cada item es una discrepancia con su `sql` |
+| `join-reorder` | `total_cost`, `total_syntactic`, `factor`; cada item: `query`, `cost_best`, `syntactic_best`, `verdict` |
+| `cardinality` | `median_q`, `p90_q`, `max_q_nulls`; cada item: `suite` (`tpch`/`nulls`), `query`, `relations`, `est_rows`, `veta_count`, `duckdb_count`, `q` |
+| `merge-equivalence` | `parts_before`, `parts_after`; items por consulta como en `clickbench-verify` |
+| `concurrent-reader` | `iterations`, `mismatches`, `errors`, `parts_start`, `parts_end` |
+| `crash-merge`, `crash-insert` | `iterations`, `failed`, `alive_fraction`; `crash-insert` además `partial_batches` |
+| `corruption` | cada item: `file_type` (`part.txt`, `primary.idx`, `bin`, `mrk`, `stats.bin`, `sample.bin`, `checksums.txt`), `exit_code`, `detached` (bool), `verdict` |
+| `parquet-read-duckdb` | `encodings_covered`, `compressions_covered`; cada item: `file` (ruta absoluta), `verdict` |
+| `parquet-read-hits`, `parquet-write-duckdb`, `parquet-write-clickhouse`, `parquet-stats` | cada item: `file` (ruta absoluta), `table`, `verdict` |
+| `parquet-rowgroup-skip` | cada item: `query`, `row_groups_read`, `row_groups_total`, `verdict` |
+| `disk-bytes` | `veta_bytes`, `clickhouse_bytes`, `factor` |
+| `compressor` | `ratio_vlz`, `ratio_lz4`, `dspeed_vlz`, `dspeed_lz4`; cada item: `file`, `raw_bytes`, `vlz_bytes`, `vlz_decompress_mb_s`, `lz4_bytes`, `lz4_decompress_mb_s` |
+| `perf-clickbench`, `perf-tpch` | `times.csv` en `runs/perf-<b>/`; `ratios` por referencia con `per_query` y `geomean` |
+| `rss` | cada item: `query` (`clickbench-q01`…, `tpch-q01`…), `max_rss_kb` |
+| `threads` | `t1`, `t12`, `factor` |
+| `mutants` | cada item: `mutant`, `killed` (bool), `by` (lista de comandos) |
+| `all` | cada item: `command` (el nombre de la línea `RESULT`: `clickbench-verify-duckdb`, `tpch-verify-sf10`, `perf-clickbench`, …), `status`, `exit_code` |
+| `size` | `engine_lines`, `harness_lines` |
+
+Definiciones: líneas no vacías = líneas con `line.strip() != ""`; mediana = `statistics.median`; percentil 90 = rango más cercano (`sorted(q)[ceil(0.9·n) − 1]`); `times.csv` tiene una fila por consulta y motor (`engine` ∈ `veta`, `clickhouse`, `duckdb`) con segundos.
 
 ## 18. Catálogo de mutantes
 
@@ -487,7 +518,7 @@ Las 23 decisiones delegadas a K0 por la idea, en su orden, y después las que ab
     Razón: ambas son LTS vigentes el 2026-11-01 y los binarios fijados hacen reproducible cada comparación.
 14. **Nombres y forma de los comandos.**
     Decisión: §13, §14.2 y §17.
-    Razón: un solo punto de entrada (`python3 -m harness`) con un contrato de salida uniforme deja que los checkers lean el resultado sin interpretar texto libre.
+    Razón: un solo punto de entrada (`python3 -m harness`) con un contrato de salida uniforme deja leer cada resultado sin interpretar texto libre.
 15. **Catálogo de mutantes.**
     Decisión: §18 (los seis de la idea, como features de Cargo).
     Razón: una feature no se desincroniza del código como un parche y el binario normal nunca la incluye.
@@ -536,14 +567,14 @@ Decisiones abiertas por el diseño:
 29. **Licencia y archivos de terceros.**
     Decisión: el repo es Apache-2.0; las consultas y esquemas de ClickBench (CC BY-NC-SA 4.0) no se versionan, se descargan fijados.
     Razón: mezclar esa licencia en el árbol del producto lo contaminaría; las consultas TPC-H de DuckDB (MIT) también se descargan, por simetría.
-30. **Los checkers de cada K exigen los binarios.**
-    Decisión: en un checker de K, un comando que termina con 77 cuenta como FAIL.
-    Razón: un K se cierra con evidencia; el 77 de la idea queda para el usuario que corre `all` sin los binarios.
+30. **El cierre de cada fase exige los binarios.**
+    Decisión: al cerrar una fase K, un comando que termina con 77 cuenta como fallo.
+    Razón: una fase se cierra con evidencia; el 77 de la idea queda para quien corre `all` sin los binarios.
 
 ## 20. Contradicciones resueltas
 
-- El método saca los «mutantes como puerta de cierre» y la idea pide un catálogo de mutantes. Se resuelve a favor de la idea: el catálogo es un criterio del producto (comando `mutants`), no una puerta del método; ningún checker de K corre mutantes salvo el criterio `k4.mutants`.
-- El método fija ~15 % de código de verificación sobre producto y la idea pide que el arnés mida menos que el motor. El arnés es producto (lo que el proyecto enseña); el presupuesto del 15 % se aplica a `vault/private/checks/`.
+- El método saca los «mutantes como puerta de cierre» y la idea pide un catálogo de mutantes. Se resuelve a favor de la idea: el catálogo es un criterio del producto (comando `mutants`), no una puerta de cierre de fase; solo se exige al cerrar K4.
+- El método fija ~15 % de código de verificación sobre producto y la idea pide que el arnés mida menos que el motor. El arnés es producto (lo que el proyecto enseña); el presupuesto del 15 % se aplica a la verificación propia del proceso de desarrollo, no al arnés.
 - La idea pide que DuckDB escriba cada codificación, incluida DELTA_BYTE_ARRAY, y DuckDB no la escribe: decisión 19.
 - La idea pide el mismo resultado que ClickHouse y que DuckDB, y los oráculos discrepan en Q4 y Q29: §15.4.
 - La idea dice «por debajo de 16 GB» y la máquina expone 14 GiB: el tope es 10 GiB.
