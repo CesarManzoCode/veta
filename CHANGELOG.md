@@ -2,6 +2,12 @@
 
 ## Sin publicar
 
+### K1 — almacenamiento y ClickBench (en curso)
+
+- Workspace de Cargo con los siete crates del grafo de §2 y `Cargo.lock` sin dependencias externas.
+- `veta-core`: tipos, valores con orden total, mapa de validez, vectores y chunks, errores con código de salida, xxh64, CRC32C (SSE4.2 y tabla), CRC-32, HyperLogLog p = 12, PRNG determinista, fechas, decimales, formato TSV, estadísticas, filtros de escaneo y contador de memoria. Implementado; sin verificar todavía.
+- Binario `veta`: reconoce los subcomandos de §13 y responde `unsupported: <subcomando>` (exit 1).
+
 ### K0 — fundación (2026-11-01)
 
 - Contrato del motor y del arnés (`vault/CONTRACT.md`): formato de partes, publicación atómica, fusión, códecs, Parquet, SQL, optimizador, ejecución, CLI, comandos de verificación y umbrales.

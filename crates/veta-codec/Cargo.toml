@@ -1,0 +1,8 @@
+[package]
+name = "veta-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+veta-core = { path = "../veta-core" }
