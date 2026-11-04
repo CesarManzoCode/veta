@@ -7,7 +7,7 @@ fn main() -> ExitCode {
     match veta_cli::run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("{err}");
+            eprintln!("veta: {err}");
             ExitCode::from(err.exit_code())
         }
     }
