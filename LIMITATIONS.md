@@ -9,11 +9,11 @@ Fuente única de lo que veta no demuestra. Ningún otro archivo repite estos lí
 - No hay particiones: todas las partes pertenecen a una partición única.
 - No hay `INSERT`, `UPDATE` ni `DELETE` en SQL; los datos entran con `veta load` desde Parquet o TSV.
 - No hay derrame a disco: una consulta que pasa el límite de memoria falla con exit 4.
-- Un lector mantiene abierto un descriptor por cada columna leída de cada parte activa. `veta` sube su límite blando de archivos abiertos al duro (reejecutándose una vez con `ulimit` de `/bin/sh`); si el límite duro no alcanza, la consulta falla con un error de E/S `Too many open files`.
+- Un lector mantiene abierto un descriptor por cada columna leída de cada parte activa. `veta` sube su límite blando de archivos abiertos al duro (reejecutándose una vez con `ulimit` de `/bin/sh`); si el límite duro no alcanza, la consulta falla con un error de E/S `Too many open files`. La subida solo ocurre en Linux con `/proc/self/limits` legible y `/bin/sh`, y no ocurre si el límite duro es `unlimited`; entonces `veta` sigue con el límite blando que hereda.
 - El SQL es el subconjunto que exigen las 65 consultas de ClickBench y TPC-H (sin `UNION`, ventanas, `INTERVAL`, tipos anidados ni funciones fuera de esa lista).
 - Las cadenas son bytes: `length` y `substring` cuentan bytes, no caracteres.
 - `Timestamp` tiene resolución de segundos.
-- Parquet: sin tipos anidados ni REPEATED, sin INT96, sin cifrado, sin bloom filters ni page index; compresión solo UNCOMPRESSED y SNAPPY (no ZSTD, GZIP, LZ4, LZ4_RAW ni BROTLI), así que no lee los Parquet por omisión de ClickHouse (zstd).
+- Parquet: sin tipos anidados ni REPEATED, sin INT96, sin cifrado, sin bloom filters ni page index; compresión solo UNCOMPRESSED y SNAPPY (no ZSTD, GZIP, LZ4, LZ4_RAW ni BROTLI), así que no lee los Parquet por omisión de ClickHouse (zstd). Una página con niveles en BIT_PACKED es un error; solo se tolera que un chunk la liste en sus codificaciones.
 
 ## Alcance de la evidencia
 
@@ -29,4 +29,6 @@ Fuente única de lo que veta no demuestra. Ningún otro archivo repite estos lí
 - `kill -9` deja la caché de páginas intacta: los cortes no prueban pérdida de energía, aunque el protocolo hace `fsync`.
 - DELTA_BYTE_ARRAY no la escribe ningún oráculo: su lectura se prueba con dos archivos de `apache/parquet-testing` y su escritura con lo que leen DuckDB y ClickHouse.
 - El catálogo de mutantes tiene seis fallas plantadas; que todas mueran no prueba que el arnés detecte cualquier falla.
+- `make check` solo vuelve fatales los avisos `clippy::correctness` y `clippy::suspicious`; al cierre de K1 quedan 16 avisos de estilo y complejidad sin corregir.
+- La comparación de ClickBench al cierre de K1 se midió con la tabla `hits` de veta en 10 partes (una por archivo), sin fusiones; el resultado sobre una sola parte fusionada es criterio de K3 (`merge-equivalence`).
 - La afirmación de que el proyecto es más difícil que otros proyectos de César no tiene criterio automático.
