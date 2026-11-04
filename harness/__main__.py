@@ -5,6 +5,7 @@ turns that, or a `Skip`/`Infra` exception, into the RESULT line and the exit cod
 """
 
 import argparse
+import resource
 import sys
 import traceback
 
@@ -65,8 +66,21 @@ def run_command(func, name: str, args, p) -> int:
     return report.finish(status, summary)
 
 
+def raise_open_files_limit() -> None:
+    """Soft RLIMIT_NOFILE up to the hard one, inherited by every engine run: veta keeps one
+    descriptor per column read in each part (contract §6.3) and would otherwise re-execute
+    itself to raise it, which the timings would count."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft != hard:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    raise_open_files_limit()
     return run_command(args.func, report_name(args), args, paths())
 
 

@@ -4,6 +4,7 @@
 
 mod args;
 mod codec_tools;
+pub mod fd_limit;
 mod table_tools;
 
 use std::io::{self, BufWriter, Write};

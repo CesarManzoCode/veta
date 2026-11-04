@@ -918,3 +918,72 @@ fn unsupported_subcommands_exit_with_1() {
         assert_eq!(stderr, format!("veta: unsupported: {name}\n"));
     }
 }
+
+/// `veta` run through `sh` with its soft limit of open files lowered to `soft`.
+fn veta_with_soft_nofile(soft: u32, args: &[&str], raise: bool) -> Output {
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("n=$1; shift; ulimit -S -n \"$n\" && exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_veta"))
+        .arg(soft.to_string())
+        .args(args);
+    if raise {
+        command.env_remove(veta_cli::fd_limit::REEXEC_MARK);
+    } else {
+        command.env(veta_cli::fd_limit::REEXEC_MARK, "1");
+    }
+    command.output().expect("the shell runs")
+}
+
+#[test]
+fn reading_more_files_than_the_soft_limit_raises_it() {
+    // 5 parts × 20 columns keep 100 `c<N>.bin` open (contract §6.3), above a soft limit of 64.
+    let dir = test_dir("nofile");
+    let db = dir.join("db");
+    let columns: Vec<String> = (1..20).map(|c| format!("c{c} INTEGER")).collect();
+    let create = format!(
+        "CREATE TABLE w (k BIGINT NOT NULL, {}, PRIMARY KEY (k)) ENGINE = MergeTree",
+        columns.join(", ")
+    );
+    let done = veta(&["sql", "--db", text(&db), &create]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    let tsv = dir.join("w.tsv");
+    let content: String = (0..50)
+        .map(|k| {
+            let cells: Vec<String> = (0..20).map(|c| (k * 100 + c).to_string()).collect();
+            cells.join("\t") + "\n"
+        })
+        .collect();
+    fs::write(&tsv, content).unwrap();
+    let load = [
+        "load",
+        "--db",
+        text(&db),
+        "--table",
+        "w",
+        "--tsv",
+        text(&tsv),
+        "--batch-rows",
+        "10",
+    ];
+    let done = veta(&load);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+
+    let query = ["sql", "--db", text(&db), "SELECT * FROM w ORDER BY k"];
+    let kept = veta_with_soft_nofile(64, &query, false);
+    assert_ne!(kept.status.code(), Some(0), "{kept:?}");
+    let stderr = String::from_utf8(kept.stderr).unwrap();
+    assert!(stderr.contains("Too many open files"), "{stderr}");
+
+    let raised = veta_with_soft_nofile(64, &query, true);
+    assert_eq!(raised.status.code(), Some(0), "{raised:?}");
+    let lines: Vec<String> = String::from_utf8(raised.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines.len(), 50);
+    let first: Vec<String> = (0..20).map(|c| c.to_string()).collect();
+    assert_eq!(lines[0], first.join("\t"));
+}

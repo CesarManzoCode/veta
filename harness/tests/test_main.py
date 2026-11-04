@@ -1,8 +1,9 @@
 import contextlib
 import io
+import resource
 import unittest
 
-from harness.__main__ import build_parser, report_name
+from harness.__main__ import build_parser, raise_open_files_limit, report_name
 
 
 class ParserTest(unittest.TestCase):
@@ -35,6 +36,17 @@ class ParserTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
             build_parser().parse_args(["load"])
         self.assertEqual(cm.exception.code, 2)
+
+
+class OpenFilesLimitTest(unittest.TestCase):
+    def test_soft_limit_rises_to_hard(self):
+        before = resource.getrlimit(resource.RLIMIT_NOFILE)
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, before)
+        hard = before[1]
+        low = 64 if hard == resource.RLIM_INFINITY else min(64, hard)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (low, hard))
+        raise_open_files_limit()
+        self.assertEqual(resource.getrlimit(resource.RLIMIT_NOFILE), (hard, hard))
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ Fuente única de lo que veta no demuestra. Ningún otro archivo repite estos lí
 - No hay particiones: todas las partes pertenecen a una partición única.
 - No hay `INSERT`, `UPDATE` ni `DELETE` en SQL; los datos entran con `veta load` desde Parquet o TSV.
 - No hay derrame a disco: una consulta que pasa el límite de memoria falla con exit 4.
+- Un lector mantiene abierto un descriptor por cada columna leída de cada parte activa. `veta` sube su límite blando de archivos abiertos al duro (reejecutándose una vez con `ulimit` de `/bin/sh`); si el límite duro no alcanza, la consulta falla con un error de E/S `Too many open files`.
 - El SQL es el subconjunto que exigen las 65 consultas de ClickBench y TPC-H (sin `UNION`, ventanas, `INTERVAL`, tipos anidados ni funciones fuera de esa lista).
 - Las cadenas son bytes: `length` y `substring` cuentan bytes, no caracteres.
 - `Timestamp` tiene resolución de segundos.
