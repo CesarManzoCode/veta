@@ -1,11 +1,15 @@
-"""ClickBench data: `load clickbench [--rebuild-veta]` (contract §14.3)."""
+"""ClickBench: `load clickbench` (§14.3), `clickbench-verify` (§15), `pruning` and
+`codec-roundtrip` over `hits` (§17)."""
 
+import argparse
+import re
 import shutil
 import time
 from pathlib import Path
 
+from harness import compare
 from harness.config import HITS_PINS, HITS_ROWS, Paths
-from harness.engines import Databases, EngineRun, Engines, clickbench_databases
+from harness.engines import Databases, EngineRun, Engines, clickbench_databases, veta_stats
 from harness.report import FAIL, PASS, SKIP, Infra, Report, Skip
 
 TABLE = "hits"
@@ -182,3 +186,207 @@ def load(args, p: Paths, report: Report):
     if "skipped" in actions.values():
         return SKIP, summary
     return PASS, summary
+
+
+# clickbench-verify
+
+QUERY_COUNT = 43
+PRUNING_QUERIES = range(37, 44)
+
+# §15.4, the only rewrites allowed; veta always runs the ClickHouse text unchanged.
+CLICKHOUSE_Q4 = "SELECT AVG(toInt128(UserID)) FROM hits;"
+Q29_PATTERN_START = "REGEXP_REPLACE(Referer, '"
+
+
+def query_id(n: int) -> str:
+    return f"q{n:02d}"
+
+
+def tamper_query(value: str) -> str:
+    """`--tamper` accepts `5`, `q5`, `Q05`…; returns the item name `q05`."""
+    m = re.fullmatch(r"[qQ]?(\d+)", value.strip())
+    if not m or not 1 <= int(m.group(1)) <= QUERY_COUNT:
+        raise argparse.ArgumentTypeError(f"not a ClickBench query (1..{QUERY_COUNT}): {value}")
+    return query_id(int(m.group(1)))
+
+
+def read_queries(path: Path) -> list[str]:
+    """The 43 queries of a pinned `queries-*.sql`, one per non-empty line."""
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
+    if len(lines) != QUERY_COUNT:
+        raise Infra(f"{path}: {len(lines)} queries, expected {QUERY_COUNT}")
+    return lines
+
+
+def duckdb_q29(text: str) -> str:
+    """Q29 for DuckDB: the pattern starts with `(?s)` so `.` also matches `\\n`."""
+    if text.count(Q29_PATTERN_START) != 1:
+        raise Infra("ClickBench Q29 does not have the expected REGEXP_REPLACE pattern")
+    return text.replace(Q29_PATTERN_START, Q29_PATTERN_START + "(?s)", 1)
+
+
+def oracle_queries(against: str, clickhouse_texts: list[str], duckdb_texts: list[str]) -> list[str]:
+    if against == "clickhouse":
+        texts = list(clickhouse_texts)
+        texts[3] = CLICKHOUSE_Q4
+    else:
+        texts = list(duckdb_texts)
+        texts[28] = duckdb_q29(texts[28])
+    return texts
+
+
+def require_loaded(engines: Engines, dbs: Databases, *engine_names: str) -> None:
+    """Missing binaries are SKIP (oracles) or 2 (veta); missing loaded data is 2."""
+    for name in engine_names:
+        engines.require(name)
+    missing = {
+        "veta": dbs.veta,
+        "duckdb": dbs.duckdb,
+        "clickhouse": dbs.clickhouse_path,
+    }
+    for name in engine_names:
+        if not missing[name].exists():
+            raise Infra(f"{name}: {missing[name]} not found; run python3 -m harness load clickbench")
+
+
+def query_files(p: Paths) -> tuple[Path, Path]:
+    files = (p.clickbench / "queries-clickhouse.sql", p.clickbench / "queries-duckdb.sql")
+    for f in files:
+        if not f.is_file():
+            raise Infra(f"{f} missing; run python3 -m harness fetch")
+    return files
+
+
+def oracle_side(engines: Engines, dbs: Databases, against: str) -> compare.Side:
+    if against == "duckdb":
+        return compare.Side("duckdb", lambda sql: engines.duckdb(dbs.duckdb, sql), "duckdb")
+    return compare.Side(
+        "clickhouse",
+        lambda sql: engines.clickhouse(sql, dbs.clickhouse_database, dbs.clickhouse_path),
+        "clickhouse",
+    )
+
+
+def verify_report_name(args) -> str:
+    return f"clickbench-verify-{args.against}"
+
+
+def verify(args, p: Paths, report: Report):
+    """`clickbench-verify --against duckdb|clickhouse [--tamper Q]`: `43/43 equal` to pass."""
+    engines = Engines(p)
+    dbs = clickbench_databases(p)
+    require_loaded(engines, dbs, "veta", args.against)
+    clickhouse_file, duckdb_file = query_files(p)
+    veta_texts = read_queries(clickhouse_file)
+    ref_texts = oracle_queries(args.against, veta_texts, read_queries(duckdb_file))
+    veta = compare.Side("veta", lambda sql: engines.veta_sql(dbs.veta, sql), "veta")
+    ref = oracle_side(engines, dbs, args.against)
+    report.fields["against"] = args.against
+    if args.tamper:
+        report.fields["tamper"] = args.tamper
+    equal = 0
+    for n, (veta_sql, ref_sql) in enumerate(zip(veta_texts, ref_texts), 1):
+        qid = query_id(n)
+        c = compare.verify_query(qid, veta, ref, veta_sql, ref_sql, tampered=args.tamper == qid, raw=report.raw)
+        equal += c.verdict == compare.EQUAL
+        report.add({
+            "query": qid,
+            "rule": c.rule,
+            "verdict": c.verdict,
+            "rows": {"veta": c.rows_engine, args.against: c.rows_ref},
+            "reason": c.reason,
+        })
+        report.progress(f"{qid} {c.rule} {c.verdict} {c.reason}".rstrip())
+    return (PASS if equal == QUERY_COUNT else FAIL), f"{equal}/{QUERY_COUNT} equal"
+
+
+def pruning(args, p: Paths, report: Report):
+    """Q37–Q43 with and without pruning: fewer granules read and the same results."""
+    engines = Engines(p)
+    dbs = clickbench_databases(p)
+    require_loaded(engines, dbs, "veta")
+    texts = read_queries(query_files(p)[0])
+    prune = compare.Side("veta", lambda sql: engines.veta_sql(dbs.veta, sql, stats=True), "veta")
+    noprune = compare.Side(
+        "veta", lambda sql: engines.veta_sql(dbs.veta, sql, stats=True, extra=["--no-prune"]), "veta",
+        suffix=".noprune",
+    )
+    good = 0
+    for n in PRUNING_QUERIES:
+        qid = query_id(n)
+        sql = texts[n - 1]
+        c = compare.verify_query(qid, prune, noprune, sql, sql, raw=report.raw)
+        read_prune = granules_read(c.engine_run)
+        read_noprune = granules_read(c.ref_run)
+        verdict, reason = c.verdict, c.reason
+        if verdict == compare.EQUAL:
+            if read_prune is None or read_noprune is None:
+                verdict, reason = compare.ERROR, "no VETA_STATS granules_read on stderr"
+            elif read_prune >= read_noprune:
+                verdict = compare.DIFFERENT
+                reason = f"granules_read with pruning {read_prune} >= without {read_noprune}"
+        good += verdict == compare.EQUAL
+        report.add({
+            "query": qid,
+            "granules_read_prune": read_prune,
+            "granules_read_noprune": read_noprune,
+            "verdict": verdict,
+            "rule": c.rule,
+            "reason": reason,
+        })
+        report.progress(f"{qid} granules {read_prune} vs {read_noprune} {verdict} {reason}".rstrip())
+    total = len(PRUNING_QUERIES)
+    return (PASS if good == total else FAIL), f"{good}/{total} pruned and equal"
+
+
+def granules_read(run: EngineRun | None) -> int | None:
+    stats = veta_stats(run.stderr) if run is not None else None
+    value = stats.get("granules_read") if stats else None
+    return value if isinstance(value, int) else None
+
+
+# codec-roundtrip
+
+ROUNDTRIP_RE = re.compile(rb"codec-roundtrip: (\d+) cases, (\d+) failures")
+
+
+def roundtrip_counts(stdout: bytes) -> tuple[int, int] | None:
+    found = ROUNDTRIP_RE.findall(stdout)
+    return (int(found[-1][0]), int(found[-1][1])) if found else None
+
+
+def codec_roundtrip(args, p: Paths, report: Report):
+    """`veta codec-roundtrip --random 2000 --seed 1` and over `hits`: both must exit 0."""
+    engines = Engines(p)
+    dbs = clickbench_databases(p)
+    require_loaded(engines, dbs, "veta")
+    cases = (
+        ("random", ("codec-roundtrip", "--random", 2000, "--seed", 1)),
+        ("hits", ("codec-roundtrip", "--db", dbs.veta, "--table", TABLE)),
+    )
+    total_cases = total_failures = 0
+    bad = []
+    for name, argv in cases:
+        report.progress(f"{name}: running")
+        run = engines.veta(*argv)
+        report.raw("veta", name, run.stdout)
+        counts = roundtrip_counts(run.stdout)
+        ok = run.ok and counts is not None and counts[1] == 0
+        if counts is not None:
+            total_cases += counts[0]
+            total_failures += counts[1]
+        if not ok:
+            bad.append(name)
+        report.add({
+            "case": name,
+            "exit_code": run.code,
+            "cases": counts[0] if counts else None,
+            "failures": counts[1] if counts else None,
+            "verdict": "ok" if ok else "fail",
+            "reason": "" if ok else run.error_tail(),
+        })
+        report.progress(f"{name}: exit {run.code}, {counts}")
+    summary = f"{total_cases} cases, {total_failures} failures"
+    if bad:
+        summary += f"; failed: {', '.join(bad)}"
+    return (PASS if not bad else FAIL), summary

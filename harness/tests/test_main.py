@@ -2,7 +2,7 @@ import contextlib
 import io
 import unittest
 
-from harness.__main__ import build_parser
+from harness.__main__ import build_parser, report_name
 
 
 class ParserTest(unittest.TestCase):
@@ -13,6 +13,23 @@ class ParserTest(unittest.TestCase):
         args = parser.parse_args(["load", "clickbench", "--rebuild-veta"])
         self.assertEqual((args.report_name, args.rebuild_veta), ("load-clickbench", True))
         self.assertFalse(parser.parse_args(["load", "clickbench"]).rebuild_veta)
+
+    def test_verification_commands(self):
+        parser = build_parser()
+        args = parser.parse_args(["clickbench-verify", "--against", "duckdb"])
+        self.assertEqual((report_name(args), args.tamper), ("clickbench-verify-duckdb", None))
+        args = parser.parse_args(["clickbench-verify", "--against", "clickhouse", "--tamper", "7"])
+        self.assertEqual((report_name(args), args.tamper), ("clickbench-verify-clickhouse", "q07"))
+        for name in ("pruning", "codec-roundtrip", "size", "deps"):
+            self.assertEqual(report_name(parser.parse_args([name])), name)
+
+    def test_bad_tamper_and_oracle_are_usage_errors(self):
+        for argv in (["clickbench-verify", "--against", "duckdb", "--tamper", "44"],
+                     ["clickbench-verify", "--against", "sqlite"],
+                     ["clickbench-verify"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+                build_parser().parse_args(argv)
+            self.assertEqual(cm.exception.code, 2)
 
     def test_usage_error_exits_2(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:

@@ -91,6 +91,15 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(engines.split_rows(""), [])
         self.assertEqual(engines.split_rows("\n"), [""])
 
+    def test_veta_stats(self):
+        stderr = (b"warning\n"
+                  b'VETA_STATS {"parts_total":10,"parts_read":3,"granules_total":1221,"granules_read":40,'
+                  b'"rows_read":327680,"row_groups_total":0,"row_groups_read":0}\n')
+        stats = engines.veta_stats(stderr)
+        self.assertEqual((stats["granules_read"], stats["parts_read"]), (40, 3))
+        self.assertIsNone(engines.veta_stats(b"no stats\n"))
+        self.assertIsNone(engines.veta_stats(b"VETA_STATS {broken\n"))
+
     def test_decode_keeps_invalid_bytes(self):
         raw = b"caf\xc3\xa9 \xff\xfe"
         text = engines.decode(raw)

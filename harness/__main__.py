@@ -8,7 +8,7 @@ import argparse
 import sys
 import traceback
 
-from harness import clickbench, fetch
+from harness import clickbench, fetch, meta
 from harness.config import paths
 from harness.report import EXIT_USAGE, FAIL, SKIP, Infra, Report, Skip
 
@@ -25,7 +25,30 @@ def build_parser() -> argparse.ArgumentParser:
     b = benches.add_parser("clickbench", help="hits_0..hits_9 into veta, DuckDB and ClickHouse")
     b.add_argument("--rebuild-veta", action="store_true", help="rebuild only the veta database")
     b.set_defaults(func=clickbench.load, report_name="load-clickbench")
+
+    p = commands.add_parser("clickbench-verify", help="the 43 ClickBench queries against an oracle")
+    p.add_argument("--against", required=True, choices=("duckdb", "clickhouse"))
+    p.add_argument("--tamper", type=clickbench.tamper_query, metavar="Q",
+                   help="change the oracle's first cell of query Q; the command must then FAIL")
+    p.set_defaults(func=clickbench.verify, report_name=clickbench.verify_report_name)
+
+    p = commands.add_parser("pruning", help="Q37-Q43 read fewer granules with pruning, same results")
+    p.set_defaults(func=clickbench.pruning, report_name="pruning")
+
+    p = commands.add_parser("codec-roundtrip", help="veta codec-roundtrip on random columns and on hits")
+    p.set_defaults(func=clickbench.codec_roundtrip, report_name="codec-roundtrip")
+
+    p = commands.add_parser("size", help="non-empty lines of the engine and of the harness")
+    p.set_defaults(func=meta.size, report_name="size")
+
+    p = commands.add_parser("deps", help="only workspace crates and the Python standard library")
+    p.set_defaults(func=meta.deps, report_name="deps")
     return parser
+
+
+def report_name(args) -> str:
+    """A fixed name, or one derived from the options (`clickbench-verify-duckdb`)."""
+    return args.report_name(args) if callable(args.report_name) else args.report_name
 
 
 def run_command(func, name: str, args, p) -> int:
@@ -44,7 +67,7 @@ def run_command(func, name: str, args, p) -> int:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    return run_command(args.func, args.report_name, args, paths())
+    return run_command(args.func, report_name(args), args, paths())
 
 
 if __name__ == "__main__":

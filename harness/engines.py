@@ -1,5 +1,6 @@
 """Adapters for veta, DuckDB and ClickHouse with the exact invocation of contract §14.4."""
 
+import json
 import os
 import re
 import subprocess
@@ -48,6 +49,18 @@ def clickhouse_time(stderr: bytes) -> float | None:
         return float(lines[-1])
     except ValueError:
         return None
+
+
+def veta_stats(stderr: bytes) -> dict | None:
+    """The last `VETA_STATS {…}` line that `--stats` writes to stderr (contract §13)."""
+    found = None
+    for line in stderr.split(b"\n"):
+        if line.startswith(b"VETA_STATS "):
+            try:
+                found = json.loads(line[len(b"VETA_STATS "):])
+            except ValueError:
+                continue
+    return found if isinstance(found, dict) else None
 
 
 def veta_sql_command(veta_bin: Path, db: Path, sql: str, stats: bool = False, extra=()) -> list[str]:
@@ -206,6 +219,10 @@ class Engines:
             case _:
                 body, seconds = out, clickhouse_time(err)
         return EngineRun(engine, argv, code, out, err, seconds, body)
+
+    def veta(self, *args) -> EngineRun:
+        """Any other `veta` subcommand, e.g. `veta("codec-roundtrip", "--random", 2000)`."""
+        return self._run("veta", [str(self.paths.veta_bin), *map(str, args)])
 
     def veta_sql(self, db: Path, sql: str, stats: bool = False, extra=()) -> EngineRun:
         return self._run("veta", veta_sql_command(self.paths.veta_bin, db, sql, stats, extra))

@@ -23,6 +23,7 @@ Fuente única de lo que veta no demuestra. Ningún otro archivo repite estos lí
 - En el subconjunto, ClickBench Q20 y Q42 devuelven 0 filas en ambos oráculos, así que esas dos solo prueban el resultado vacío.
 - ClickBench Q4 y Q29 se comparan contra una reescritura en un oráculo (ClickHouse desborda `AVG` en Int64; DuckDB no hace coincidir `.` con `\n`); veta corre el texto original.
 - En los empates del borde de `LIMIT` se comparan las claves de orden, no las demás columnas de esas filas.
+- `--tamper` cambia la primera celda de la primera fila de la referencia: si esa celda no es clave de orden y su fila cae en un grupo de empates que corta un `OFFSET` (o un `LIMIT` cuando el grupo llena la ventana), el cambio queda dentro de lo que el borde de `LIMIT` admite y no se detecta; con un resultado de referencia vacío no hay celda que cambiar y la consulta se informa como error.
 - La estimación de cardinalidad se mide con TPC-H, cuyos datos son uniformes e independientes, y con una suite sintética de NULL; no con datos correlacionados como el Join Order Benchmark.
 - `kill -9` deja la caché de páginas intacta: los cortes no prueban pérdida de energía, aunque el protocolo hace `fsync`.
 - DELTA_BYTE_ARRAY no la escribe ningún oráculo: su lectura se prueba con dos archivos de `apache/parquet-testing` y su escritura con lo que leen DuckDB y ClickHouse.
