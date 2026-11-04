@@ -4,3 +4,4 @@
 /.claude/
 /target/
 /.veta-data/
+__pycache__/
