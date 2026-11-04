@@ -12,13 +12,24 @@ use veta_core::{Field, Schema};
 
 use crate::expr::{AggregateExpr, BoundExpr, value_to_sql};
 
+/// Join kinds of §11.1. `Semi`, `Anti`, `NullAwareAnti` and `Single` come from the
+/// unnesting of subqueries (§10.4); a left row matches a right row when every key pair is
+/// equal (NULL never equals) and the residual is true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinKind {
     Inner,
     Left,
+    /// Left rows with at least one match, once each; output: the left columns.
     Semi,
+    /// Left rows without any match; output: the left columns.
     Anti,
+    /// `x NOT IN (subquery)` with the key `x = col`: a left row passes when the right
+    /// input is empty, or when its `x` is not NULL, no right row has `col = x` and no right
+    /// row has a NULL `col`. Output: the left columns.
     NullAwareAnti,
+    /// Scalar subquery: every left row with the columns of its only match, or NULLs
+    /// without a match; a left row with more than one match is an error. Without keys the
+    /// right input is evaluated once.
     Single,
     Cross,
 }

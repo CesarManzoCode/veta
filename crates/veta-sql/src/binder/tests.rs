@@ -479,14 +479,28 @@ fn ctes_subqueries_and_parquet() {
 }
 
 #[test]
-fn subqueries_in_expressions_are_unsupported() {
-    for sql in [
-        "SELECT * FROM hits WHERE UserID IN (SELECT UserID FROM hits)",
-        "SELECT * FROM hits WHERE EXISTS (SELECT 1 FROM orders)",
-        "SELECT (SELECT COUNT(*) FROM orders) FROM hits",
-    ] {
-        assert_eq!(error(sql), "unsupported: subquery");
-    }
+fn subqueries_in_expressions_are_unnested() {
+    let p = plan("SELECT URL FROM hits WHERE UserID IN (SELECT UserID FROM hits AS h)");
+    assert!(
+        p.display_tree()
+            .contains("Join semi keys=[hits.UserID = h.UserID]"),
+        "{}",
+        p.display_tree()
+    );
+    let p = plan("SELECT URL FROM hits WHERE EXISTS (SELECT 1 FROM orders)");
+    assert!(p.display_tree().contains("Join semi\n"));
+    let p = plan("SELECT (SELECT COUNT(*) FROM orders) AS n, URL FROM hits");
+    assert!(p.display_tree().contains("Join single\n"));
+    assert_eq!(
+        p.schema().data_types(),
+        vec![DataType::Int64, DataType::Varchar]
+    );
+    // A subquery in ON has no rewrite.
+    let e = error(
+        "SELECT 1 FROM orders JOIN lineitem ON o_orderkey = l_orderkey \
+         AND EXISTS (SELECT 1 FROM customer)",
+    );
+    assert!(e.starts_with("unsupported: subquery here"), "{e}");
 }
 
 #[test]

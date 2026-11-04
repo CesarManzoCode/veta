@@ -12,15 +12,20 @@
 //! other predicates stay in a `Filter` above the join tree. When that order differs from
 //! the `FROM` order a `Project` restores the `FROM` column order.
 //!
-//! Subqueries inside expressions are `unsupported: subquery` until K2.
+//! Subqueries inside expressions are always unnested into joins (§10.4, §19 decision 27);
+//! [`subquery`] holds the rewrites. A `WHERE` conjunct with a subquery is applied after the
+//! `Filter` of the plain conjuncts, in syntactic order; scalar subqueries of the select
+//! list, `HAVING` and `ORDER BY` are joined above the `FROM` (or, in an aggregated query,
+//! above the `Aggregate`). Only the `WHERE` of a subquery may reference the query right
+//! above it.
 
 use std::collections::HashSet;
 
 use veta_core::{DataType, Result, Value, VetaError};
 
 use crate::ast::{
-    BinaryOp, Expr, Function, JoinKind as AstJoinKind, Literal, Query, SelectItem, TableRef,
-    UnaryOp,
+    BinaryOp, Expr, Function, JoinKind as AstJoinKind, Literal, Query, Select, SelectItem,
+    TableRef, UnaryOp,
 };
 use crate::catalog::Catalog;
 use crate::display::write_ident;
@@ -35,6 +40,9 @@ pub fn bind_query(catalog: &dyn Catalog, query: &Query) -> Result<LogicalPlan> {
     Binder {
         catalog,
         ctes: Vec::new(),
+        outer: None,
+        unreachable: Vec::new(),
+        subqueries: 0,
     }
     .query(query)
 }
@@ -53,6 +61,12 @@ struct ScopeColumn {
 #[derive(Debug, Clone, Default)]
 struct Scope {
     columns: Vec<ScopeColumn>,
+    /// With `Some(k)`, `columns[..k]` (the query's own `FROM`) shadow `columns[k..]` (the
+    /// `FROM` of the query right above, which a correlated `WHERE` may reference).
+    shadow: Option<usize>,
+    /// Columns of enclosing queries that this scope cannot reference; naming one is
+    /// `unsupported: correlated subquery …` instead of `column not found`.
+    unreachable: Vec<ScopeColumn>,
 }
 
 fn ident(name: &str) -> String {
@@ -76,6 +90,7 @@ impl Scope {
                     nullable: f.nullable,
                 })
                 .collect(),
+            ..Scope::default()
         }
     }
 
@@ -83,10 +98,15 @@ impl Scope {
         self.columns.len()
     }
 
+    /// `self` followed by `other`, keeping the unreachable columns of `self`.
     fn concat(&self, other: &Scope) -> Scope {
         let mut columns = self.columns.clone();
         columns.extend(other.columns.iter().cloned());
-        Scope { columns }
+        Scope {
+            columns,
+            shadow: None,
+            unreachable: self.unreachable.clone(),
+        }
     }
 
     fn qualifiers(&self) -> HashSet<String> {
@@ -96,33 +116,58 @@ impl Scope {
             .collect()
     }
 
-    /// Index of `[table.]name`; `Ok(None)` when no column matches.
+    /// Index of `[table.]name`; `Ok(None)` when no column matches. The query's own columns
+    /// are searched before those of the query above (see `shadow`).
     fn resolve(&self, table: Option<&str>, name: &str) -> Result<Option<usize>> {
-        let mut found = None;
-        for (i, c) in self.columns.iter().enumerate() {
-            let table_matches = table.is_none_or(|t| c.qualifier.eq_ignore_ascii_case(t));
-            if table_matches && c.name.eq_ignore_ascii_case(name) {
-                if found.is_some() {
-                    return Err(VetaError::user(format!(
-                        "ambiguous column reference: {}",
-                        column_text(table, name)
-                    )));
-                }
-                found = Some(i);
+        let split = self.shadow.unwrap_or(self.columns.len());
+        for range in [0..split, split..self.columns.len()] {
+            let start = range.start;
+            if let Some(i) = find_column(&self.columns[range], table, name)? {
+                return Ok(Some(start + i));
             }
         }
-        Ok(found)
+        if find_column(&self.unreachable, table, name)?.is_some() {
+            return Err(VetaError::unsupported(format!(
+                "correlated subquery reference to {} here (only the WHERE of a subquery may \
+                 reference the query right above it)",
+                column_text(table, name)
+            )));
+        }
+        Ok(None)
     }
 
+    /// `alias.col`; just the name for the columns that hold a scalar subquery.
     fn sql_name(&self, index: usize) -> String {
         let c = &self.columns[index];
-        format!("{}.{}", ident(&c.qualifier), ident(&c.name))
+        if c.qualifier.is_empty() {
+            ident(&c.name)
+        } else {
+            format!("{}.{}", ident(&c.qualifier), ident(&c.name))
+        }
     }
 
     fn expr(&self, index: usize) -> BoundExpr {
         let c = &self.columns[index];
         BoundExpr::column(index, self.sql_name(index), c.data_type, c.nullable)
     }
+}
+
+/// Position of `[table.]name` in `columns`; an error when it matches twice.
+fn find_column(columns: &[ScopeColumn], table: Option<&str>, name: &str) -> Result<Option<usize>> {
+    let mut found = None;
+    for (i, c) in columns.iter().enumerate() {
+        let table_matches = table.is_none_or(|t| c.qualifier.eq_ignore_ascii_case(t));
+        if table_matches && c.name.eq_ignore_ascii_case(name) {
+            if found.is_some() {
+                return Err(VetaError::user(format!(
+                    "ambiguous column reference: {}",
+                    column_text(table, name)
+                )));
+            }
+            found = Some(i);
+        }
+    }
+    Ok(found)
 }
 
 fn column_text(table: Option<&str>, name: &str) -> String {
@@ -658,7 +703,9 @@ fn bind_expr(
             )
         }
         Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => {
-            return Err(VetaError::unsupported("subquery"));
+            return Err(VetaError::unsupported(
+                "subquery here (only in WHERE, HAVING, ORDER BY and the select list)",
+            ));
         }
         Expr::Like {
             expr,
@@ -883,10 +930,20 @@ fn register_aggregate(aggs: &mut Vec<AggregateExpr>, agg: AggregateExpr) -> Resu
     ))
 }
 
+/// Index base of the columns a scalar subquery adds above an `Aggregate` before the number
+/// of aggregates is final; [`resolve_pending`] turns them into real indices.
+const PENDING: usize = usize::MAX / 2;
+
 /// Rewrites an expression bound over the `FROM` scope into one over the `Aggregate`
 /// output (groups, then aggregates): subexpressions equal to a group become that group
-/// column, aggregate references move past the groups, and any other column is an error.
-fn finalize_aggregated(e: &mut BoundExpr, groups: &[BoundExpr]) -> Result<()> {
+/// column, aggregate references move past the groups, columns from `subquery_from` on
+/// (scalar subqueries joined above the `Aggregate`) become `PENDING + k`, and any other
+/// column is an error.
+fn finalize_aggregated(
+    e: &mut BoundExpr,
+    groups: &[BoundExpr],
+    subquery_from: usize,
+) -> Result<()> {
     if let Some(i) = groups.iter().position(|g| *g == *e) {
         *e = BoundExpr::column(
             i,
@@ -900,6 +957,12 @@ fn finalize_aggregated(e: &mut BoundExpr, groups: &[BoundExpr]) -> Result<()> {
         *index += groups.len();
         return Ok(());
     }
+    if let BoundExprKind::Column { index, .. } = &mut e.kind
+        && *index >= subquery_from
+    {
+        *index = PENDING + (*index - subquery_from);
+        return Ok(());
+    }
     if let BoundExprKind::Column { name, .. } = &e.kind {
         return Err(VetaError::user(format!(
             "column {name} must appear in GROUP BY or be used in an aggregate function"
@@ -907,7 +970,18 @@ fn finalize_aggregated(e: &mut BoundExpr, groups: &[BoundExpr]) -> Result<()> {
     }
     e.children_mut()
         .into_iter()
-        .try_for_each(|c| finalize_aggregated(c, groups))
+        .try_for_each(|c| finalize_aggregated(c, groups, subquery_from))
+}
+
+/// Turns the `PENDING + k` columns of [`finalize_aggregated`] into `width + k`.
+fn resolve_pending(e: &mut BoundExpr, width: usize) {
+    e.map_columns(&mut |i| {
+        if i >= PENDING {
+            width + (i - PENDING)
+        } else {
+            i
+        }
+    });
 }
 
 /// Copy of `e` where `f` replaces the subexpressions it returns `Some` for.
@@ -1120,6 +1194,22 @@ struct Binder<'a> {
     catalog: &'a dyn Catalog,
     /// Visible `WITH` entries, innermost last.
     ctes: Vec<(String, LogicalPlan)>,
+    /// `FROM` scope of the query right above, when the query being bound is a subquery
+    /// inside one of its expressions: its `WHERE` may reference these columns.
+    outer: Option<Scope>,
+    /// Columns of the other enclosing queries, which no conjunct may reference.
+    unreachable: Vec<ScopeColumn>,
+    /// Scalar subqueries replaced by a column so far, to name those columns.
+    subqueries: usize,
+}
+
+/// A query's `FROM` with its whole `WHERE` applied, before the select list.
+struct FromWhere {
+    plan: LogicalPlan,
+    /// The `FROM` columns, in `FROM` order; `plan` has exactly these.
+    scope: Scope,
+    /// `WHERE` conjuncts that reference the query above, over `scope ++ outer`.
+    correlated: Vec<BoundExpr>,
 }
 
 /// One select-list entry after `*` expansion.
@@ -1130,27 +1220,107 @@ struct Item {
 }
 
 impl Binder<'_> {
+    /// Binds a query that cannot reference an enclosing one: the whole statement, a `WITH`
+    /// entry or a subquery in `FROM`.
     fn query(&mut self, q: &Query) -> Result<LogicalPlan> {
+        self.with_ctes(q, |b| {
+            let body = b.from_where(&q.body)?;
+            if !body.correlated.is_empty() {
+                return Err(VetaError::internal(
+                    "correlated predicate outside a subquery",
+                ));
+            }
+            b.select(q, body)
+        })
+    }
+
+    /// Runs `f` with the `WITH` entries of `q` visible.
+    fn with_ctes<T>(&mut self, q: &Query, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         let depth = self.ctes.len();
-        let result = self.query_with_ctes(q);
+        let mut result = Ok(());
+        for cte in &q.ctes {
+            match self.with_outer(None, |b| b.query(&cte.query)) {
+                Ok(plan) => self.ctes.push((cte.name.clone(), plan)),
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        let result = match result {
+            Ok(()) => f(self),
+            Err(e) => Err(e),
+        };
         self.ctes.truncate(depth);
         result
     }
 
-    fn query_with_ctes(&mut self, q: &Query) -> Result<LogicalPlan> {
-        for cte in &q.ctes {
-            let plan = self.query(&cte.query)?;
-            self.ctes.push((cte.name.clone(), plan));
+    /// Runs `f` with `outer` as the query right above; the previous one becomes
+    /// unreachable.
+    fn with_outer<T>(
+        &mut self,
+        outer: Option<Scope>,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let saved_unreachable = self.unreachable.clone();
+        let saved_outer = std::mem::replace(&mut self.outer, outer);
+        if let Some(previous) = &saved_outer {
+            self.unreachable.extend(previous.columns.iter().cloned());
         }
-        self.select(q)
+        let result = f(self);
+        self.outer = saved_outer;
+        self.unreachable = saved_unreachable;
+        result
     }
 
-    fn select(&mut self, q: &Query) -> Result<LogicalPlan> {
-        let s = &q.body;
-        let (mut plan, scope, filters) = self.from_group(&s.from, s.where_.as_ref())?;
+    /// Every enclosing column, none of which the select list, `GROUP BY`, `HAVING` or `ON`
+    /// of the current query may reference.
+    fn all_unreachable(&self) -> Vec<ScopeColumn> {
+        let mut out = self.unreachable.clone();
+        if let Some(outer) = &self.outer {
+            out.extend(outer.columns.iter().cloned());
+        }
+        out
+    }
+
+    /// `FROM` plus `WHERE`: plain conjuncts go into the join group (or out as correlated
+    /// predicates); conjuncts with subqueries are unnested on top, in order.
+    fn from_where(&mut self, s: &Select) -> Result<FromWhere> {
+        let mut plain = Vec::new();
+        let mut nested = Vec::new();
+        if let Some(w) = &s.where_ {
+            if has_aggregate(w) {
+                return Err(VetaError::user(
+                    "aggregate functions are not allowed in WHERE",
+                ));
+            }
+            for c in ast_conjuncts(w) {
+                if has_subquery(c) {
+                    nested.push(c);
+                } else {
+                    plain.push(c);
+                }
+            }
+        }
+        let (mut plan, scope, filters, correlated) = self.from_group(&s.from, &plain)?;
         if let Some(predicate) = BoundExpr::and_all(filters) {
             plan = LogicalPlan::filter(plan, predicate);
         }
+        for c in nested {
+            plan = self.where_subquery(plan, &scope, c)?;
+        }
+        Ok(FromWhere {
+            plan,
+            scope,
+            correlated,
+        })
+    }
+
+    fn select(&mut self, q: &Query, body: FromWhere) -> Result<LogicalPlan> {
+        let s = &q.body;
+        let FromWhere {
+            mut plan, scope, ..
+        } = body;
 
         let mut items = Vec::new();
         for item in &s.items {
@@ -1177,6 +1347,18 @@ impl Binder<'_> {
                 }),
             }
         }
+        // Scalar subqueries of the select list and ORDER BY become columns.
+        let mut lifted: Vec<(String, Query)> = Vec::new();
+        for item in items.iter_mut() {
+            item.expr = self.lift_scalars(&item.expr, &mut lifted);
+            reject_subqueries(&item.expr, "the select list")?;
+        }
+        let mut order_exprs = Vec::new();
+        for o in &q.order_by {
+            let e = self.lift_scalars(&o.expr, &mut lifted);
+            reject_subqueries(&e, "ORDER BY")?;
+            order_exprs.push(e);
+        }
         let aliases: Vec<(String, Expr)> = items
             .iter()
             .filter_map(|i| i.alias.clone().map(|a| (a, i.expr.clone())))
@@ -1202,10 +1384,32 @@ impl Binder<'_> {
             .having
             .as_ref()
             .map(|h| substitute_aliases(h, &aliases, &scope, true));
+        // HAVING conjuncts: IN/EXISTS become semi or anti joins, the rest is a filter.
+        let mut having_semis = Vec::new();
+        let mut having_rest = Vec::new();
+        if let Some(h) = &having_ast {
+            for c in ast_conjuncts(h) {
+                match semi_form(c) {
+                    Some(form) => having_semis.push(form),
+                    None => {
+                        let e = self.lift_scalars(c, &mut lifted);
+                        reject_subqueries(&e, "HAVING outside a conjunct")?;
+                        having_rest.push(e);
+                    }
+                }
+            }
+        }
+        let lifted_names: Vec<String> = lifted.iter().map(|(n, _)| n.clone()).collect();
+        if group_asts
+            .iter()
+            .any(|g| has_subquery(g) || mentions(g, &lifted_names))
+        {
+            return Err(VetaError::unsupported("subquery in GROUP BY"));
+        }
         let aggregated = !group_asts.is_empty()
             || having_ast.is_some()
             || items.iter().any(|i| has_aggregate(&i.expr))
-            || q.order_by.iter().any(|o| has_aggregate(&o.expr));
+            || order_exprs.iter().any(has_aggregate);
 
         let mut groups = Vec::new();
         for g in &group_asts {
@@ -1216,15 +1420,34 @@ impl Binder<'_> {
             }
             groups.push(bind_expr(g, &scope, None)?);
         }
+
+        // Each lifted scalar subquery is one more column after the FROM columns.
+        let from_width = scope.len();
+        let mut top_scope = scope.clone();
+        let mut scalars = Vec::new();
+        for (name, sq) in &lifted {
+            let sub = self.subquery(sq, &scope, SubqueryKind::Scalar)?;
+            if aggregated && !sub.is_plain() {
+                return Err(VetaError::unsupported(
+                    "correlated subquery in the select list, HAVING or ORDER BY of an \
+                     aggregated query",
+                ));
+            }
+            top_scope
+                .columns
+                .push(subquery_column(name, sub.scalar_type()?));
+            scalars.push((name.clone(), sub));
+        }
+
         let mut aggs: Vec<AggregateExpr> = Vec::new();
         // Binds an expression for the level above the aggregation (or the FROM level).
         let bind_top = |e: &Expr, aggs: &mut Vec<AggregateExpr>| -> Result<BoundExpr> {
             if aggregated {
-                let mut b = bind_expr(e, &scope, Some(aggs))?;
-                finalize_aggregated(&mut b, &groups)?;
+                let mut b = bind_expr(e, &top_scope, Some(aggs))?;
+                finalize_aggregated(&mut b, &groups, from_width)?;
                 Ok(b)
             } else {
-                bind_expr(e, &scope, None)
+                bind_expr(e, &top_scope, None)
             }
         };
 
@@ -1232,21 +1455,39 @@ impl Binder<'_> {
         for item in &items {
             exprs.push(bind_top(&item.expr, &mut aggs)?);
         }
-        let having = match &having_ast {
-            Some(h) => Some(require_type(
+        let mut having_conjuncts = Vec::new();
+        for h in &having_rest {
+            having_conjuncts.push(require_type(
                 bind_top(h, &mut aggs)?,
                 DataType::Boolean,
                 "HAVING",
-            )?),
-            None => None,
-        };
+            )?);
+        }
+        let mut semis = Vec::new();
+        for form in having_semis {
+            let value = match form.value {
+                Some(v) => {
+                    if has_subquery(v) {
+                        return Err(VetaError::unsupported("subquery on the left of IN"));
+                    }
+                    Some(bind_top(v, &mut aggs)?)
+                }
+                None => None,
+            };
+            let sub = self.subquery(form.query, &scope, form.kind())?;
+            if !sub.is_plain() {
+                return Err(VetaError::unsupported("correlated subquery in HAVING"));
+            }
+            semis.push((sub, value, form.negated));
+        }
+        let mut having = BoundExpr::and_all(having_conjuncts);
 
         // ORDER BY: ordinal, alias, an expression of the select list, or a hidden column.
         let mut names: Vec<String> = items.iter().map(|i| i.name.clone()).collect();
         let visible = items.len();
         let mut sort_targets = Vec::new();
-        for o in &q.order_by {
-            let target = match &o.expr {
+        for (position, o) in q.order_by.iter().enumerate() {
+            let target = match &order_exprs[position] {
                 Expr::Literal(Literal::Integer(k)) => {
                     let k = *k;
                     if k < 1 || k as usize > visible {
@@ -1295,6 +1536,27 @@ impl Binder<'_> {
 
         if aggregated {
             plan = LogicalPlan::aggregate(plan, groups.clone(), aggs);
+            let width = plan.schema().len();
+            for e in exprs.iter_mut().chain(having.iter_mut()) {
+                resolve_pending(e, width);
+            }
+            for (_, value, _) in semis.iter_mut() {
+                if let Some(v) = value {
+                    resolve_pending(v, width);
+                }
+            }
+        }
+        // Without aggregation `joined_scope` describes the plan as each scalar column is
+        // added; above an `Aggregate` only uncorrelated subqueries are joined, which do not
+        // use it.
+        let mut joined_scope = scope.clone();
+        for (name, sub) in scalars {
+            let (joined, column) = attach_scalar(plan, sub, &joined_scope, &name)?;
+            plan = joined;
+            joined_scope.columns.push(column);
+        }
+        for (sub, value, negated) in semis {
+            plan = attach_semi(plan, sub, value, negated)?;
         }
         if let Some(h) = having {
             plan = LogicalPlan::filter(plan, h);
@@ -1339,13 +1601,15 @@ impl Binder<'_> {
         Ok(plan)
     }
 
-    /// Binds the `FROM` entries as one join group (module docs). Returns the plan, its
-    /// scope in `FROM` order and the conjuncts left for the `Filter` above it.
+    /// Binds the `FROM` entries as one join group (module docs) with the `WHERE` conjuncts
+    /// `where_` (none with subqueries). Returns the plan, its scope in `FROM` order, the
+    /// conjuncts left for the `Filter` above it and the conjuncts that reference the
+    /// query above (over `scope ++ outer`).
     fn from_group(
         &mut self,
         from: &[TableRef],
-        where_: Option<&Expr>,
-    ) -> Result<(LogicalPlan, Scope, Vec<BoundExpr>)> {
+        where_: &[&Expr],
+    ) -> Result<(LogicalPlan, Scope, Vec<BoundExpr>, Vec<BoundExpr>)> {
         let mut refs = Vec::new();
         let mut ons = Vec::new();
         for t in from {
@@ -1363,24 +1627,39 @@ impl Binder<'_> {
             scope = scope.concat(&rel.scope);
             rels.push(rel);
         }
+        scope.unreachable = self.all_unreachable();
 
         let mut pool = Vec::new();
         for on in ons {
             let p = require_type(bind_expr(on, &scope, None)?, DataType::Boolean, "ON")?;
             pool.extend(p.into_conjuncts());
         }
-        if let Some(w) = where_ {
-            if has_aggregate(w) {
-                return Err(VetaError::user(
-                    "aggregate functions are not allowed in WHERE",
-                ));
+        // A subquery's WHERE also sees the FROM of the query above, after its own.
+        let correlated_scope = self.outer.as_ref().map(|outer| Scope {
+            columns: scope
+                .columns
+                .iter()
+                .chain(outer.columns.iter())
+                .cloned()
+                .collect(),
+            shadow: Some(scope.len()),
+            unreachable: self.unreachable.clone(),
+        });
+        let mut correlated = Vec::new();
+        for w in where_ {
+            let target = correlated_scope.as_ref().unwrap_or(&scope);
+            let p = require_type(bind_expr(w, target, None)?, DataType::Boolean, "WHERE")?;
+            for c in p.into_conjuncts() {
+                if c.columns().iter().any(|&i| i >= scope.len()) {
+                    correlated.push(c);
+                } else {
+                    pool.push(c);
+                }
             }
-            let p = require_type(bind_expr(w, &scope, None)?, DataType::Boolean, "WHERE")?;
-            pool.extend(p.into_conjuncts());
         }
 
         if rels.is_empty() {
-            return Ok((LogicalPlan::SingleRow, scope, pool));
+            return Ok((LogicalPlan::SingleRow, scope, pool, correlated));
         }
 
         let rels_of = |e: &BoundExpr| -> HashSet<usize> {
@@ -1471,7 +1750,12 @@ impl Binder<'_> {
             let names = scope.columns.iter().map(|c| c.name.clone()).collect();
             plan = LogicalPlan::project(plan, exprs, names);
         }
-        Ok((plan, scope, pool.into_iter().flatten().collect()))
+        Ok((
+            plan,
+            scope,
+            pool.into_iter().flatten().collect(),
+            correlated,
+        ))
     }
 
     fn relation(&mut self, t: &TableRef) -> Result<Relation> {
@@ -1501,7 +1785,8 @@ impl Binder<'_> {
                 alias,
                 column_aliases,
             } => {
-                let plan = self.query(query)?;
+                // Not lateral: a FROM subquery cannot reference the query around it.
+                let plan = self.with_outer(None, |b| b.query(query))?;
                 if column_aliases.len() > plan.schema().len() {
                     return Err(VetaError::user(format!(
                         "{alias} has {} columns but {} column aliases",
@@ -1567,7 +1852,7 @@ impl Binder<'_> {
 
     /// A join tree bound as its own group, with its leftover predicates applied.
     fn group_relation(&mut self, t: &TableRef) -> Result<Relation> {
-        let (mut plan, scope, filters) = self.from_group(std::slice::from_ref(t), None)?;
+        let (mut plan, scope, filters, _) = self.from_group(std::slice::from_ref(t), &[])?;
         if let Some(predicate) = BoundExpr::and_all(filters) {
             plan = LogicalPlan::filter(plan, predicate);
         }
@@ -1575,5 +1860,15 @@ impl Binder<'_> {
     }
 }
 
+mod subquery;
+
+use subquery::{
+    SubqueryKind, ast_conjuncts, attach_scalar, attach_semi, has_subquery, mentions,
+    reject_subqueries, semi_form, subquery_column,
+};
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tpch_tests;

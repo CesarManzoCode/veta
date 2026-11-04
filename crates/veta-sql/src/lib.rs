@@ -1,7 +1,8 @@
 //! Lexer, parser, AST, binder, logical plan, optimizer and statistics (contract §10–§11).
 //!
-//! Depends only on `veta-core` (contract §2). [`optimizer`] holds rules 1, 2, 4, 5 and 6
-//! of §11.2; join reordering and statistics arrive in K2.
+//! Depends only on `veta-core` (contract §2). [`binder`] unnests every subquery into
+//! joins (§10.4). [`optimizer`] holds rules 1, 2, 4, 5 and 6 of §11.2; join reordering
+//! and statistics arrive in K2.
 
 pub mod ast;
 pub mod binder;
