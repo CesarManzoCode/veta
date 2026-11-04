@@ -803,7 +803,7 @@ fn bind_expr(
         }
         Expr::CountStar => {
             let aggs = aggs.ok_or_else(aggregate_not_allowed)?;
-            register_aggregate(aggs, AggregateExpr::new(AggFunc::CountStar, false, None)?)
+            register_aggregate(aggs, AggregateExpr::new(AggFunc::CountStar, false, None)?)?
         }
         Expr::Function {
             func,

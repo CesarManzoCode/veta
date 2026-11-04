@@ -78,7 +78,7 @@ fn keyed_table(tag: &str) -> TempDb {
         let mut c = Vec::with_capacity(n);
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
-            a.push(Value::Int32(rng.range_i64(0, 8) as i32));
+            a.push(Value::Int32(rng.range_i64(0, 7) as i32));
             b.push(Value::Int64(rng.range_i64(0, 100)));
             c.push(Value::varchar(words[rng.below(4) as usize]));
             v.push(if rng.next_bool(0.1) {

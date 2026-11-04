@@ -256,7 +256,7 @@ mod tests {
             ),
             (
                 DataType::decimal(30, 4).unwrap(),
-                vec![dec(i128::MAX / 100, 30, 4), dec(1, 30, 4), Value::Null],
+                vec![dec(10i128.pow(30) - 1, 30, 4), dec(1, 30, 4), Value::Null],
             ),
             (
                 DataType::Varchar,

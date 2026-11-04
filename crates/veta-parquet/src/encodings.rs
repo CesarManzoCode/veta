@@ -650,7 +650,9 @@ mod tests {
         decode_rle_hybrid(&data, 1, 3, &mut out).unwrap();
         assert_eq!(out, [1, 0, 1]);
         let mut out = Vec::new();
-        decode_rle_hybrid(&[100 << 1, 9, 0], 9, 4, &mut out).unwrap();
+        let mut data = uleb(100 << 1);
+        data.extend_from_slice(&[9, 0]);
+        decode_rle_hybrid(&data, 9, 4, &mut out).unwrap();
         assert_eq!(out, [9; 4]);
     }
 

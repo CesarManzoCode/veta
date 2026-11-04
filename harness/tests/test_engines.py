@@ -75,7 +75,8 @@ class ParseTest(unittest.TestCase):
     def test_duckdb_timer_sums_statements_and_may_be_absent(self):
         out = b"Run Time (s): real 1.500 user 1 sys 0\nRun Time (s): real 0.25 user 0 sys 0\n"
         body, seconds = engines.strip_duckdb_timer(out)
-        self.assertEqual(body, b"\n")
+        self.assertEqual(body, b"")  # an empty result keeps no rows
+        self.assertEqual(engines.split_rows(engines.decode(body)), [])
         self.assertAlmostEqual(seconds, 1.75)
         self.assertEqual(engines.strip_duckdb_timer(b"1\n"), (b"1\n", None))
 
@@ -86,7 +87,7 @@ class ParseTest(unittest.TestCase):
         self.assertIsNone(engines.clickhouse_time(b"Code: 60. DB::Exception: no table\n"))
 
     def test_rows_split_only_on_newline(self):
-        text = engines.decode(b"a\rb\x1cc\tx\nsecond\x85\n")
+        text = engines.decode(b"a\rb\x1cc\tx\nsecond\xc2\x85\n")
         self.assertEqual(engines.split_rows(text), ["a\rb\x1cc\tx", "second\x85"])
         self.assertEqual(engines.split_rows(""), [])
         self.assertEqual(engines.split_rows("\n"), [""])
