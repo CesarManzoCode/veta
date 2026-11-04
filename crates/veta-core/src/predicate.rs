@@ -77,6 +77,21 @@ impl ScanFilter {
         }
     }
 
+    /// Whether some value `≥ min` may satisfy the filter: the range of a granule whose
+    /// upper end is NULL, which sorts after every value (contract §4), so its non-NULL
+    /// values are only bounded below. `min` NULL means the range holds only NULLs.
+    pub fn may_match_from(&self, min: &Value) -> bool {
+        if min.is_null() {
+            return false;
+        }
+        match self {
+            ScanFilter::Range { lower, upper, .. } => {
+                !bound_is_null(lower) && !bound_is_null(upper) && below_upper(upper, min)
+            }
+            ScanFilter::In { values, .. } => values.iter().any(|v| !v.is_null() && v >= min),
+        }
+    }
+
     /// Whether one value satisfies the filter.
     pub fn matches(&self, value: &Value) -> bool {
         self.may_match(value, value)
@@ -165,6 +180,25 @@ mod tests {
             }
             .may_match(&int(0), &int(10))
         );
+    }
+
+    #[test]
+    fn bounded_below_only() {
+        let lt = range(Bound::Unbounded, Bound::Excluded(int(5)));
+        assert!(lt.may_match_from(&int(4)));
+        assert!(!lt.may_match_from(&int(5)));
+        let gt = range(Bound::Excluded(int(100)), Bound::Unbounded);
+        assert!(gt.may_match_from(&int(1000)));
+        assert!(gt.may_match_from(&int(0)));
+        let set = ScanFilter::In {
+            column: 0,
+            values: vec![int(3), Value::Null],
+        };
+        assert!(set.may_match_from(&int(3)));
+        assert!(!set.may_match_from(&int(4)));
+        assert!(!gt.may_match_from(&Value::Null));
+        let null_bound = range(Bound::Unbounded, Bound::Included(Value::Null));
+        assert!(!null_bound.may_match_from(&int(0)));
     }
 
     #[test]

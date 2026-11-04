@@ -5,10 +5,12 @@
 //! is `SingleRow`, the one-row, zero-column input of a `SELECT` without `FROM` (§10.2).
 
 use std::fmt::Write;
+use std::ops::Bound;
 
+use veta_core::predicate::ScanFilter;
 use veta_core::{Field, Schema};
 
-use crate::expr::{AggregateExpr, BoundExpr};
+use crate::expr::{AggregateExpr, BoundExpr, value_to_sql};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinKind {
@@ -58,21 +60,26 @@ impl SortKey {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
-    /// Reads `columns` (indices into `table_schema`) of a stored table.
+    /// Reads `columns` (indices into `table_schema`) of a stored table. `filters` (over
+    /// `table_schema` indices) only prune parts and granules (§11.2 rule 4, §11.4); the
+    /// predicate they come from is still evaluated above the scan.
     Scan {
         table: String,
         /// Alias in the query, or the table name.
         alias: String,
         table_schema: Schema,
         columns: Vec<usize>,
+        filters: Vec<ScanFilter>,
         schema: Schema,
     },
-    /// Reads `columns` of `read_parquet('path')`.
+    /// Reads `columns` of `read_parquet('path')`; `filters` (over `file_schema` indices)
+    /// skip row groups.
     ParquetScan {
         path: String,
         alias: String,
         file_schema: Schema,
         columns: Vec<usize>,
+        filters: Vec<ScanFilter>,
         schema: Schema,
     },
     /// One row without columns.
@@ -127,6 +134,7 @@ impl LogicalPlan {
             table: table.to_string(),
             alias: alias.to_string(),
             columns: (0..table_schema.len()).collect(),
+            filters: Vec::new(),
             schema: table_schema.clone(),
             table_schema,
         }
@@ -137,6 +145,7 @@ impl LogicalPlan {
             path: path.to_string(),
             alias: alias.to_string(),
             columns: (0..file_schema.len()).collect(),
+            filters: Vec::new(),
             schema: file_schema.clone(),
             file_schema,
         }
@@ -291,9 +300,27 @@ impl LogicalPlan {
         }
         let list = |items: Vec<String>| items.join(", ");
         let _ = match self {
-            LogicalPlan::Scan { table, alias, .. } => write!(out, "Scan {table} AS {alias}"),
-            LogicalPlan::ParquetScan { path, alias, .. } => {
-                write!(out, "ParquetScan '{path}' AS {alias}")
+            LogicalPlan::Scan {
+                table,
+                alias,
+                table_schema,
+                columns,
+                filters,
+                ..
+            } => {
+                let _ = write!(out, "Scan {table} AS {alias}");
+                write_scan_details(out, table_schema, columns, filters)
+            }
+            LogicalPlan::ParquetScan {
+                path,
+                alias,
+                file_schema,
+                columns,
+                filters,
+                ..
+            } => {
+                let _ = write!(out, "ParquetScan '{path}' AS {alias}");
+                write_scan_details(out, file_schema, columns, filters)
             }
             LogicalPlan::SingleRow => write!(out, "SingleRow"),
             LogicalPlan::Filter { predicate, .. } => write!(out, "Filter {}", predicate.to_sql()),
@@ -356,6 +383,61 @@ impl LogicalPlan {
         out.push('\n');
         for child in self.children() {
             child.write_tree(out, depth + 1);
+        }
+    }
+}
+
+/// The columns of a scan when they are not all of them, and its scan filters.
+fn write_scan_details(
+    out: &mut String,
+    schema: &Schema,
+    columns: &[usize],
+    filters: &[ScanFilter],
+) -> std::fmt::Result {
+    let name = |c: usize| schema.fields.get(c).map_or("?", |f| f.name.as_str());
+    if columns.len() != schema.len() || columns.iter().enumerate().any(|(i, &c)| i != c) {
+        let names: Vec<&str> = columns.iter().map(|&c| name(c)).collect();
+        write!(out, " columns=[{}]", names.join(", "))?;
+    }
+    if !filters.is_empty() {
+        let text: Vec<String> = filters
+            .iter()
+            .map(|f| scan_filter_text(f, name(f.column())))
+            .collect();
+        write!(out, " filters=[{}]", text.join(", "))?;
+    }
+    Ok(())
+}
+
+/// `column >= lo AND column < hi`, `column = v` or `column IN (…)`.
+pub fn scan_filter_text(filter: &ScanFilter, column: &str) -> String {
+    match filter {
+        ScanFilter::Range { lower, upper, .. } => {
+            if let (Bound::Included(l), Bound::Included(u)) = (lower, upper)
+                && l == u
+            {
+                return format!("{column} = {}", value_to_sql(l));
+            }
+            let mut parts = Vec::new();
+            match lower {
+                Bound::Included(v) => parts.push(format!("{column} >= {}", value_to_sql(v))),
+                Bound::Excluded(v) => parts.push(format!("{column} > {}", value_to_sql(v))),
+                Bound::Unbounded => {}
+            }
+            match upper {
+                Bound::Included(v) => parts.push(format!("{column} <= {}", value_to_sql(v))),
+                Bound::Excluded(v) => parts.push(format!("{column} < {}", value_to_sql(v))),
+                Bound::Unbounded => {}
+            }
+            if parts.is_empty() {
+                format!("{column} IS NOT NULL")
+            } else {
+                parts.join(" AND ")
+            }
+        }
+        ScanFilter::In { values, .. } => {
+            let list: Vec<String> = values.iter().map(value_to_sql).collect();
+            format!("{column} IN ({})", list.join(", "))
         }
     }
 }

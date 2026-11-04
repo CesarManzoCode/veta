@@ -13,6 +13,8 @@ use crate::database::Database;
 pub struct ExecOptions {
     /// Worker threads, at least 1.
     pub threads: usize,
+    /// `false` with `--no-prune`: every part, granule and row group is read (§11.3).
+    pub prune: bool,
 }
 
 impl ExecOptions {
@@ -26,6 +28,7 @@ impl Default for ExecOptions {
     fn default() -> Self {
         ExecOptions {
             threads: ExecOptions::default_threads(),
+            prune: true,
         }
     }
 }
@@ -69,6 +72,8 @@ pub(crate) struct ExecContext<'a> {
     pub db: &'a Database,
     pub threads: usize,
     pub stats: &'a ExecStats,
+    /// Whether scans use their filters to skip parts, granules and row groups.
+    pub prune: bool,
 }
 
 /// An empty reservation on the process-wide memory tracker.
@@ -95,5 +100,6 @@ mod tests {
     #[test]
     fn default_threads_is_positive() {
         assert!(ExecOptions::default().threads >= 1);
+        assert!(ExecOptions::default().prune);
     }
 }

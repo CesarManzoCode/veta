@@ -463,6 +463,17 @@ pub fn trunc_unit_name(unit: TruncUnit) -> &'static str {
     }
 }
 
+/// A constant as SQL text, typed by its own value (an untyped `NULL` prints as `NULL`).
+pub fn value_to_sql(value: &Value) -> String {
+    let mut out = String::new();
+    write_value_sql(
+        &mut out,
+        value,
+        value.data_type().unwrap_or(DataType::Int32),
+    );
+    out
+}
+
 /// Writes a constant as SQL that DuckDB and veta read back as the same value and type
 /// family.
 fn write_value_sql(out: &mut String, value: &Value, data_type: DataType) {

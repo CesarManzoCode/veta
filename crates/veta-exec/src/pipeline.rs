@@ -12,9 +12,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use veta_core::memory::Reservation;
+use veta_core::predicate::ScanFilter;
 use veta_core::{Chunk, DataType, Result, Vector, VectorData, VetaError};
 use veta_parquet::ParquetFile;
 use veta_sql::{BoundExpr, BoundExprKind};
+use veta_storage::prune::prune_part;
 use veta_storage::{PartReader, Snapshot, Table, detach_part};
 
 use crate::context::{ExecContext, add, new_reservation};
@@ -273,9 +275,11 @@ impl TableSource {
 #[derive(Debug)]
 pub(crate) enum Source {
     Table(TableSource),
+    /// A Parquet file; morsel `m` is row group `row_groups[m]`.
     Parquet {
         file: ParquetFile,
         columns: Vec<usize>,
+        row_groups: Vec<usize>,
     },
     /// Chunks in memory, each one a morsel and taken only once.
     Chunks(Vec<Mutex<Option<Chunk>>>),
@@ -283,27 +287,40 @@ pub(crate) enum Source {
 
 impl Source {
     /// Takes the snapshot of `table_name` keeping `columns` open (contract §6.3) and
-    /// reports on stderr the parts it had to detach (§6.4).
-    pub fn table(ctx: &ExecContext<'_>, table_name: &str, columns: &[usize]) -> Result<Source> {
+    /// reports on stderr the parts it had to detach (§6.4). With pruning on, the morsels
+    /// cover only the granules `filters` may match (§11.4): runs of contiguous selected
+    /// granules, cut every [`MORSEL_GRANULES`].
+    pub fn table(
+        ctx: &ExecContext<'_>,
+        table_name: &str,
+        columns: &[usize],
+        filters: &[ScanFilter],
+    ) -> Result<Source> {
         let table = ctx.db.open_table(table_name)?;
         let snapshot = Snapshot::take(&table, Some(columns))?;
         for detached in snapshot.detached() {
             eprintln!("{}", detached.message());
         }
         let parts = snapshot.into_parts();
+        let filters: &[ScanFilter] = if ctx.prune { filters } else { &[] };
         let mut morsels = Vec::new();
         for (p, part) in parts.iter().enumerate() {
-            let granules = part.granules();
-            add(&ctx.stats.granules_total, granules as u64);
-            let mut start = 0;
-            while start < granules {
-                let end = (start + MORSEL_GRANULES).min(granules);
+            add(&ctx.stats.granules_total, part.granules() as u64);
+            let selected = prune_part(part, filters);
+            let mut i = 0;
+            while i < selected.len() {
+                let start = selected[i];
+                let mut end = start + 1;
+                i += 1;
+                while i < selected.len() && selected[i] == end && end - start < MORSEL_GRANULES {
+                    end += 1;
+                    i += 1;
+                }
                 morsels.push(TableMorsel {
                     part: p,
                     start,
                     end,
                 });
-                start = end;
             }
         }
         add(&ctx.stats.parts_total, parts.len() as u64);
@@ -317,13 +334,26 @@ impl Source {
         }))
     }
 
-    /// Opens the Parquet file at `path`; each row group is a morsel.
-    pub fn parquet(ctx: &ExecContext<'_>, path: &str, columns: &[usize]) -> Result<Source> {
+    /// Opens the Parquet file at `path`; each row group is a morsel. With pruning on, a
+    /// row group is skipped when the statistics of a filtered column exclude the filter
+    /// (§11.4).
+    pub fn parquet(
+        ctx: &ExecContext<'_>,
+        path: &str,
+        columns: &[usize],
+        filters: &[ScanFilter],
+    ) -> Result<Source> {
         let file = ParquetFile::open(path)?;
-        add(&ctx.stats.row_groups_total, file.num_row_groups() as u64);
+        let total = file.num_row_groups();
+        add(&ctx.stats.row_groups_total, total as u64);
+        let filters: &[ScanFilter] = if ctx.prune { filters } else { &[] };
+        let row_groups = (0..total)
+            .filter(|&rg| row_group_may_match(&file, rg, filters))
+            .collect();
         Ok(Source::Parquet {
             file,
             columns: columns.to_vec(),
+            row_groups,
         })
     }
 
@@ -345,10 +375,21 @@ impl Source {
     fn morsels(&self) -> usize {
         match self {
             Source::Table(table) => table.morsels.len(),
-            Source::Parquet { file, .. } => file.num_row_groups(),
+            Source::Parquet { row_groups, .. } => row_groups.len(),
             Source::Chunks(chunks) => chunks.len(),
         }
     }
+}
+
+/// Whether row group `rg` may hold a row satisfying every filter: a column whose chunk
+/// statistics are unknown never excludes it.
+fn row_group_may_match(file: &ParquetFile, rg: usize, filters: &[ScanFilter]) -> bool {
+    filters
+        .iter()
+        .all(|f| match file.row_group_stats(rg, f.column()) {
+            Some((min, max, _nulls)) => f.may_match(&min, &max),
+            None => true,
+        })
 }
 
 /// Output of a pipeline break: chunks in result order and the memory they hold.
@@ -441,9 +482,13 @@ impl Pipeline {
                 }
                 Ok(())
             }
-            Source::Parquet { file, columns } => {
+            Source::Parquet {
+                file,
+                columns,
+                row_groups,
+            } => {
                 add(&ctx.stats.row_groups_read, 1);
-                for chunk in file.scan(vec![m], columns.clone())? {
+                for chunk in file.scan(vec![row_groups[m]], columns.clone())? {
                     let chunk = chunk?;
                     add(&ctx.stats.rows_read, chunk.len as u64);
                     self.push_chunk(chunk, sink)?;
@@ -661,6 +706,7 @@ mod tests {
             db: &db,
             threads: 8,
             stats: &stats,
+            prune: true,
         };
         let chunks: Vec<Chunk> = (0..200).map(|i| int_chunk(&[i, i + 1000])).collect();
         let out = collect(Pipeline::new(Source::chunks(chunks)), &ctx, None).unwrap();
@@ -680,6 +726,7 @@ mod tests {
                 db: &db,
                 threads,
                 stats: &stats,
+                prune: true,
             };
             let chunks: Vec<Chunk> = (0..500).map(|i| int_chunk(&[i])).collect();
             let out = collect(Pipeline::new(Source::chunks(chunks)), &ctx, Some(5)).unwrap();
@@ -697,6 +744,7 @@ mod tests {
             db: &db,
             threads: 2,
             stats: &stats,
+            prune: true,
         };
         let column = BoundExpr::column(0, "x", DataType::Int64, false);
         let predicate = BoundExpr::new(

@@ -750,6 +750,7 @@ mod tests {
                 db: &db,
                 threads,
                 stats: &stats,
+                prune: true,
             };
             let (pipeline, mut all) = pipeline_of_random_runs(5);
             let out = sort(pipeline, &[sort_key(0, DataType::Int64, true, false)], &ctx).unwrap();
@@ -772,6 +773,7 @@ mod tests {
                 db: &db,
                 threads,
                 stats: &stats,
+                prune: true,
             };
             let (pipeline, mut all) = pipeline_of_random_runs(9);
             let out = top_n(
@@ -828,6 +830,7 @@ mod tests {
             db: &db,
             threads: 4,
             stats: &stats,
+            prune: true,
         };
         let out = sort(
             Pipeline::new(Source::chunks(Vec::new())),

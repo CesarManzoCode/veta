@@ -2,7 +2,9 @@
 //!
 //! `Filter` and `Project` stream over the pipeline below them; `Aggregate`, `Sort`, `TopN`
 //! and `Limit` end one, and their output is the source of the next. Joins arrive with K2.
-//! `Scan` reads the columns the plan names, so the plan decides what is read (§11.2 rule 5).
+//! `Scan` reads the columns the plan names, so the plan decides what is read (§11.2 rule 5),
+//! and skips the parts, granules and row groups its filters exclude unless `--no-prune`
+//! (§11.4).
 
 use veta_core::memory::Reservation;
 use veta_core::{Chunk, Result, Schema, VetaError};
@@ -33,6 +35,7 @@ pub fn execute(
         db,
         threads: options.threads.max(1),
         stats,
+        prune: options.prune,
     };
     let materialized = execute_plan(plan, &ctx)?;
     Ok(QueryResult {
@@ -96,12 +99,18 @@ fn execute_plan(plan: &LogicalPlan, ctx: &ExecContext<'_>) -> Result<Materialize
 /// materialized output of the pipeline break below, if any.
 fn build_pipeline(plan: &LogicalPlan, ctx: &ExecContext<'_>) -> Result<Pipeline> {
     match plan {
-        LogicalPlan::Scan { table, columns, .. } => {
-            Ok(Pipeline::new(Source::table(ctx, table, columns)?))
-        }
-        LogicalPlan::ParquetScan { path, columns, .. } => {
-            Ok(Pipeline::new(Source::parquet(ctx, path, columns)?))
-        }
+        LogicalPlan::Scan {
+            table,
+            columns,
+            filters,
+            ..
+        } => Ok(Pipeline::new(Source::table(ctx, table, columns, filters)?)),
+        LogicalPlan::ParquetScan {
+            path,
+            columns,
+            filters,
+            ..
+        } => Ok(Pipeline::new(Source::parquet(ctx, path, columns, filters)?)),
         LogicalPlan::SingleRow => Ok(Pipeline::new(Source::single_row()?)),
         LogicalPlan::Filter { input, predicate } => {
             let mut pipeline = build_pipeline(input, ctx)?;
@@ -116,6 +125,9 @@ fn build_pipeline(plan: &LogicalPlan, ctx: &ExecContext<'_>) -> Result<Pipeline>
         _ => Ok(Pipeline::over(execute_plan(plan, ctx)?)),
     }
 }
+
+#[cfg(test)]
+mod prune_tests;
 
 #[cfg(test)]
 mod tests {
@@ -145,7 +157,15 @@ mod tests {
         };
         let plan = bind_query(db, &q)?;
         let stats = ExecStats::default();
-        let result = execute(db, &plan, &ExecOptions { threads }, &stats)?;
+        let result = execute(
+            db,
+            &plan,
+            &ExecOptions {
+                threads,
+                prune: true,
+            },
+            &stats,
+        )?;
         Ok(result
             .chunks
             .iter()
@@ -236,7 +256,16 @@ mod tests {
         };
         let plan = bind_query(&db, &q).unwrap();
         let stats = ExecStats::default();
-        execute(&db, &plan, &ExecOptions { threads: 2 }, &stats).unwrap();
+        execute(
+            &db,
+            &plan,
+            &ExecOptions {
+                threads: 2,
+                prune: true,
+            },
+            &stats,
+        )
+        .unwrap();
         assert_eq!(
             stats.to_json(),
             "{\"parts_total\":3,\"parts_read\":3,\"granules_total\":3,\"granules_read\":3,\"rows_read\":3000,\"row_groups_total\":0,\"row_groups_read\":0}"

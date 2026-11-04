@@ -7,6 +7,7 @@
 //! - [`table`]: table directories; [`locks`]: `flock` helpers.
 //! - [`insert`]: atomic insertion of §6.1; [`snapshot`]: reader snapshot of §6.3;
 //!   [`recover`]: recovery of §6.5 and detaching of broken parts (§6.4).
+//! - [`prune`]: part and granule selection by the sparse primary index (§11.4).
 //! - [`sort`]: ordering of a batch by the primary key with typed comparators.
 
 pub mod block;
@@ -15,6 +16,7 @@ mod fsutil;
 pub mod insert;
 pub mod locks;
 pub mod part;
+pub mod prune;
 pub mod recover;
 pub mod snapshot;
 pub mod sort;

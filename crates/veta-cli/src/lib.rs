@@ -13,7 +13,7 @@ use veta_core::error::{Result, VetaError};
 use veta_core::format;
 use veta_core::memory;
 use veta_exec::{Database, ExecOptions, ExecStats, LoadInput, execute};
-use veta_sql::{Statement, bind_query, parse_statements};
+use veta_sql::{OptimizerOptions, Statement, bind_query, optimize, parse_statements};
 
 use args::Parsed;
 
@@ -187,7 +187,15 @@ fn cmd_sql(args: &[String]) -> Result<()> {
         return Err(VetaError::user("syntax error: empty statement"));
     }
     let stats = ExecStats::default();
-    let options = ExecOptions { threads };
+    // §11.3: `--no-optimizer` leaves only column pruning; `--no-prune` only stops the
+    // skipping of parts, granules and row groups.
+    let optimizer = OptimizerOptions {
+        enabled: !parsed.flag("--no-optimizer"),
+    };
+    let options = ExecOptions {
+        threads,
+        prune: !parsed.flag("--no-prune"),
+    };
     let stdout = io::stdout();
     let mut out = BufWriter::with_capacity(1 << 16, stdout.lock());
     for statement in &statements {
@@ -196,7 +204,7 @@ fn cmd_sql(args: &[String]) -> Result<()> {
                 db.create_table(create)?;
             }
             Statement::Query(query) => {
-                let plan = bind_query(&db, query)?;
+                let plan = optimize(bind_query(&db, query)?, optimizer);
                 let result = execute(&db, &plan, &options, &stats)?;
                 let mut text = Vec::new();
                 if output_format == OutputFormat::TsvHeader {
