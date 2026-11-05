@@ -192,10 +192,13 @@ def parse(sql: str) -> Query:
     words = [t for t in tokens if t.word != ","]
     if not words or words[0].word not in ("SELECT", "WITH"):
         raise SqlTextError("not a SELECT")
-    if words[0].word == "WITH":
-        raise SqlTextError("top-level WITH is not supported by the comparison")
     if any(t.word in ("UNION", "INTERSECT", "EXCEPT") for t in words):
         raise SqlTextError("top-level set operation is not supported by the comparison")
+    # The bodies of a WITH are in parentheses, so the first top-level SELECT is the query's own.
+    first = next((n for n, t in enumerate(words) if t.word == "SELECT"), None)
+    if first is None:
+        raise SqlTextError("WITH without a SELECT")
+    words = words[first:]
     select_kw = words[0]
     select_start = select_kw.end
     clause_starts = [t for t in words[1:] if t.word in CLAUSES]

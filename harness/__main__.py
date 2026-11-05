@@ -9,7 +9,7 @@ import resource
 import sys
 import traceback
 
-from harness import clickbench, fetch, meta
+from harness import clickbench, fetch, meta, tpch
 from harness.config import paths
 from harness.report import EXIT_USAGE, FAIL, SKIP, Infra, Report, Skip
 
@@ -26,12 +26,26 @@ def build_parser() -> argparse.ArgumentParser:
     b = benches.add_parser("clickbench", help="hits_0..hits_9 into veta, DuckDB and ClickHouse")
     b.add_argument("--rebuild-veta", action="store_true", help="rebuild only the veta database")
     b.set_defaults(func=clickbench.load, report_name="load-clickbench")
+    b = benches.add_parser("tpch", help="one scale factor into DuckDB, veta and ClickHouse")
+    b.add_argument("--sf", type=int, required=True, choices=tpch.SCALE_FACTORS)
+    b.add_argument("--rebuild-veta", action="store_true", help="rebuild only the veta database")
+    b.set_defaults(func=tpch.load, report_name=tpch.load_report_name)
 
     p = commands.add_parser("clickbench-verify", help="the 43 ClickBench queries against an oracle")
     p.add_argument("--against", required=True, choices=("duckdb", "clickhouse"))
     p.add_argument("--tamper", type=clickbench.tamper_query, metavar="Q",
                    help="change the oracle's first cell of query Q; the command must then FAIL")
     p.set_defaults(func=clickbench.verify, report_name=clickbench.verify_report_name)
+
+    p = commands.add_parser("tpch-verify", help="the 22 TPC-H queries against tpch_answers() or DuckDB")
+    p.add_argument("--sf", type=int, required=True, choices=tpch.SCALE_FACTORS)
+    p.set_defaults(func=tpch.verify, report_name=tpch.verify_report_name)
+
+    p = commands.add_parser("join-reorder", help="TPC-H SF1 with cost and syntactic join orders")
+    p.set_defaults(func=tpch.join_reorder, report_name="join-reorder")
+
+    p = commands.add_parser("cardinality", help="error q of the join nodes of TPC-H SF1 and of the NULL suite")
+    p.set_defaults(func=tpch.cardinality, report_name="cardinality")
 
     p = commands.add_parser("pruning", help="Q37-Q43 read fewer granules with pruning, same results")
     p.set_defaults(func=clickbench.pruning, report_name="pruning")

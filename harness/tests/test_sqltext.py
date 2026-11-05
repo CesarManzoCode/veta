@@ -95,6 +95,20 @@ class ClauseTest(unittest.TestCase):
         with self.assertRaises(sqltext.SqlTextError):
             sqltext.without_limit_aliased(sqltext.parse("SELECT * FROM t LIMIT 1"))
 
+    def test_top_level_with(self):
+        sql = ("WITH r AS (SELECT a, sum(b) AS total FROM t ORDER BY a LIMIT 5), s AS (SELECT 1 AS x)\n"
+               "SELECT a, total AS revenue FROM r ORDER BY revenue DESC LIMIT 3;")
+        q = sqltext.parse(sql)
+        self.assertEqual([item.alias for item in q.items], [None, "revenue"])
+        self.assertEqual((q.limit, [k.expr for k in q.order_by]), (3, ["revenue"]))
+        self.assertEqual(sqltext.order_plan(q).key_columns, (1,))
+        self.assertTrue(sqltext.without_limit_aliased(q).startswith("WITH r AS ("))
+        self.assertTrue(sqltext.without_limit_aliased(q).endswith("ORDER BY revenue DESC"))
+
+    def test_with_without_a_select(self):
+        with self.assertRaises(sqltext.SqlTextError):
+            sqltext.parse("WITH r AS (SELECT 1)")
+
     def test_errors(self):
         for sql in ("SELECT (a FROM t", "SELECT 'a FROM t", "INSERT INTO t VALUES (1)",
                     "SELECT a FROM t UNION ALL SELECT b FROM u", "SELECT a FROM t LIMIT x"):

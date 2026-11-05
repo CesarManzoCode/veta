@@ -24,6 +24,22 @@ class ParserTest(unittest.TestCase):
         for name in ("pruning", "codec-roundtrip", "size", "deps"):
             self.assertEqual(report_name(parser.parse_args([name])), name)
 
+    def test_tpch_commands(self):
+        parser = build_parser()
+        args = parser.parse_args(["load", "tpch", "--sf", "10", "--rebuild-veta"])
+        self.assertEqual((report_name(args), args.rebuild_veta), ("load-tpch-sf10", True))
+        self.assertFalse(parser.parse_args(["load", "tpch", "--sf", "1"]).rebuild_veta)
+        self.assertEqual(report_name(parser.parse_args(["tpch-verify", "--sf", "1"])), "tpch-verify-sf1")
+        self.assertEqual(report_name(parser.parse_args(["tpch-verify", "--sf", "10"])), "tpch-verify-sf10")
+        for name in ("join-reorder", "cardinality"):
+            self.assertEqual(report_name(parser.parse_args([name])), name)
+
+    def test_a_scale_factor_is_required_and_pinned(self):
+        for argv in (["tpch-verify"], ["tpch-verify", "--sf", "100"], ["load", "tpch"], ["load", "tpch", "--sf", "2"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+                build_parser().parse_args(argv)
+            self.assertEqual(cm.exception.code, 2)
+
     def test_bad_tamper_and_oracle_are_usage_errors(self):
         for argv in (["clickbench-verify", "--against", "duckdb", "--tamper", "44"],
                      ["clickbench-verify", "--against", "sqlite"],
