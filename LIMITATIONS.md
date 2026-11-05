@@ -32,6 +32,8 @@ Fuente única de lo que veta no demuestra. Ningún otro archivo repite estos lí
 - TPC-H SF10 no tiene respuestas oficiales en `tpch_answers()`: `tpch-verify --sf 10` solo compara con DuckDB, que además genera esos datos.
 - §11.5 no fija la estimación de los joins `Semi`, `Anti`, `NullAwareAnti`, `Left` y `Single`, ni la de una tabla sin estadísticas o un predicado que mezcla relaciones: veta usa reglas de diseño propias (contención de NDV, 1000 filas, 0.1 por conjunción), documentadas en `crates/veta-sql/src/cardinality.rs` y sin medir.
 - La regla 3 cuesta un join sin clave con la misma fórmula que un hash join, aunque su trabajo real crece con `|L|·|R|`; un árbol de más de 64 relaciones conserva el orden del binder. Ninguna de las dos decisiones está medida.
+- `tlp` y `optimizer-oracle` solo comparan a veta consigo mismo: un error que afecte por igual a la consulta y a sus particiones, o a los dos modos del optimizador, no se detecta.
+- Las consultas aleatorias no generan subconsultas, `HAVING`, `AVG`, `COUNT(DISTINCT)`, `Float64` ni `Timestamp`, y solo dos tablas pueden unirse por cadenas o sin clave de igualdad. TLP tampoco ejercita `TopN` en las particiones: quita `ORDER BY` y `LIMIT` y ordena en el arnés.
 - `kill -9` deja la caché de páginas intacta: los cortes no prueban pérdida de energía, aunque el protocolo hace `fsync`.
 - DELTA_BYTE_ARRAY no la escribe ningún oráculo: su lectura se prueba con dos archivos de `apache/parquet-testing` y su escritura con lo que leen DuckDB y ClickHouse.
 - El catálogo de mutantes tiene seis fallas plantadas; que todas mueran no prueba que el arnés detecte cualquier falla.

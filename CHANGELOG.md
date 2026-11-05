@@ -2,6 +2,18 @@
 
 ## Sin publicar
 
+### K2 — subconsultas, joins, optimizador con cardinalidad, TPC-H y oráculos (2026-11-04)
+
+Implementado y sin medir: ningún comando de este K se ha corrido todavía; los criterios los verifica el cierre del K.
+
+- Subconsultas desanidadas en el binder: semi, anti, anti consciente de NULL y `single` (§10.4).
+- Joins hash particionados y paralelos, y joins de bucle anidado para los que no tienen clave.
+- Estadísticas de tabla y estimador de cardinalidad (§11.5).
+- Reordenación de joins internos por costo (DPccp, voraz por encima de 12 relaciones), `--join-order` y `EXPLAIN ANALYZE`.
+- Arnés: `load tpch`, `tpch-verify`, `join-reorder` y `cardinality`.
+- Arnés: `gen.py` genera tablas y consultas aleatorias con semilla fija (§17). `tlp` compara cada consulta con la unión de sus particiones `p`, `NOT p` y `p IS NULL`; `optimizer-oracle` compara con y sin `--no-optimizer` esas consultas, las 43 de ClickBench y las 22 de TPC-H. Un error del motor en cualquier ejecución cuenta como discrepancia.
+- Decisión: el generador cambia de base cada 250 consultas (cada una con sus 3 tablas), para que el número de filas y las fracciones de NULL también varíen dentro de una corrida. Con menos consultas que el umbral de §16, `tlp` y `optimizer-oracle` terminan en FAIL.
+
 ### K1 — almacenamiento, códecs, lectura Parquet y ClickBench correcto (2026-11-04)
 
 - Las 43 consultas de ClickBench sobre `hits_0..hits_9` (10 M filas) devuelven lo mismo que DuckDB 2.0.0 y que ClickHouse 26.8.34.13. Verificado con `clickbench-verify --against duckdb|clickhouse`: 43/43 iguales.

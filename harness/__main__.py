@@ -9,7 +9,7 @@ import resource
 import sys
 import traceback
 
-from harness import clickbench, fetch, meta, tpch
+from harness import clickbench, fetch, meta, oracles, tpch
 from harness.config import paths
 from harness.report import EXIT_USAGE, FAIL, SKIP, Infra, Report, Skip
 
@@ -40,6 +40,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = commands.add_parser("tpch-verify", help="the 22 TPC-H queries against tpch_answers() or DuckDB")
     p.add_argument("--sf", type=int, required=True, choices=tpch.SCALE_FACTORS)
     p.set_defaults(func=tpch.verify, report_name=tpch.verify_report_name)
+
+    p = commands.add_parser("tlp", help="random queries against the union of their partitions")
+    p.add_argument("--queries", type=oracles.query_count, default=oracles.DEFAULT_QUERIES, metavar="N")
+    p.add_argument("--seed", type=int, default=oracles.DEFAULT_SEED, metavar="S")
+    p.set_defaults(func=oracles.tlp, report_name="tlp")
+
+    p = commands.add_parser("optimizer-oracle", help="random queries and the 65 with and without --no-optimizer")
+    p.add_argument("--queries", type=oracles.query_count, default=oracles.DEFAULT_QUERIES, metavar="N")
+    p.add_argument("--seed", type=int, default=oracles.DEFAULT_SEED, metavar="S")
+    p.set_defaults(func=oracles.optimizer_oracle, report_name="optimizer-oracle")
 
     p = commands.add_parser("join-reorder", help="TPC-H SF1 with cost and syntactic join orders")
     p.set_defaults(func=tpch.join_reorder, report_name="join-reorder")

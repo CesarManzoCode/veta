@@ -34,6 +34,18 @@ class ParserTest(unittest.TestCase):
         for name in ("join-reorder", "cardinality"):
             self.assertEqual(report_name(parser.parse_args([name])), name)
 
+    def test_oracle_commands(self):
+        parser = build_parser()
+        for name in ("tlp", "optimizer-oracle"):
+            args = parser.parse_args([name])
+            self.assertEqual((report_name(args), args.queries, args.seed), (name, 1000, 1))
+            args = parser.parse_args([name, "--queries", "5", "--seed", "9"])
+            self.assertEqual((args.queries, args.seed), (5, 9))
+            for bad in ("0", "-1", "x"):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+                    parser.parse_args([name, "--queries", bad])
+                self.assertEqual(cm.exception.code, 2)
+
     def test_a_scale_factor_is_required_and_pinned(self):
         for argv in (["tpch-verify"], ["tpch-verify", "--sf", "100"], ["load", "tpch"], ["load", "tpch", "--sf", "2"]):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
