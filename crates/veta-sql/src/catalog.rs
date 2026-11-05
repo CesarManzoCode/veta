@@ -1,7 +1,7 @@
 //! What the binder needs to know about tables and Parquet files (contract §10.2, §11.5).
 //!
 //! The storage layer implements [`Catalog`] in the CLI; the binder only sees schemas,
-//! primary keys and, from K2 on, statistics and predicate selectivities.
+//! primary keys, statistics, Parquet row counts and predicate selectivities.
 
 use veta_core::stats::TableStats;
 use veta_core::{Result, Schema, VetaError};
@@ -27,8 +27,13 @@ pub trait Catalog {
     /// Schema of the Parquet file at `path`, for `read_parquet('path')`.
     fn parquet_schema(&self, path: &str) -> Result<Schema>;
 
-    /// Selectivity of a single-table predicate measured on the table sample (§11.5).
-    /// `None` means unknown; it stays unknown until K2.
+    /// Row count of `read_parquet('path')` from the file metadata (§11.5); `None` if the
+    /// file cannot be read.
+    fn parquet_rows(&self, path: &str) -> Option<u64>;
+
+    /// Selectivity of a single-table predicate, bound over the table schema, measured on
+    /// the union of the part samples (§11.5). `None` means unknown (no statistics or an
+    /// empty sample).
     fn selectivity(&self, table: &str, predicate: &BoundExpr) -> Option<f64>;
 }
 
@@ -37,6 +42,8 @@ pub trait Catalog {
 pub struct MemoryCatalog {
     pub tables: Vec<CatalogTable>,
     pub parquet_files: Vec<(String, Schema)>,
+    /// Row counts of Parquet files, by path.
+    pub parquet_rows: Vec<(String, u64)>,
 }
 
 impl MemoryCatalog {
@@ -56,6 +63,21 @@ impl MemoryCatalog {
     pub fn add_parquet(&mut self, path: &str, schema: Schema) {
         self.parquet_files.push((path.to_string(), schema));
     }
+
+    /// Attaches statistics to the table `name` added before.
+    pub fn set_stats(&mut self, name: &str, stats: TableStats) {
+        if let Some(table) = self
+            .tables
+            .iter_mut()
+            .find(|t| t.name.eq_ignore_ascii_case(name))
+        {
+            table.stats = Some(stats);
+        }
+    }
+
+    pub fn set_parquet_rows(&mut self, path: &str, rows: u64) {
+        self.parquet_rows.push((path.to_string(), rows));
+    }
 }
 
 impl Catalog for MemoryCatalog {
@@ -74,6 +96,14 @@ impl Catalog for MemoryCatalog {
             .ok_or_else(|| VetaError::Io(format!("{path}: no such file")))
     }
 
+    fn parquet_rows(&self, path: &str) -> Option<u64> {
+        self.parquet_rows
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|&(_, rows)| rows)
+    }
+
+    /// The in-memory catalog cannot evaluate expressions: selectivities are unknown.
     fn selectivity(&self, _table: &str, _predicate: &BoundExpr) -> Option<f64> {
         None
     }
@@ -95,6 +125,10 @@ mod tests {
         assert!(catalog.table("other").is_none());
         let predicate = BoundExpr::literal(veta_core::Value::Boolean(true));
         assert_eq!(catalog.selectivity("hits", &predicate), None);
+        assert!(table.stats.is_none());
+        let stats = TableStats::new(&[DataType::Int64], 1);
+        catalog.set_stats("HITS", stats.clone());
+        assert_eq!(catalog.table("hits").unwrap().stats, Some(stats));
     }
 
     #[test]
@@ -103,6 +137,9 @@ mod tests {
         let schema = Schema::new(vec![Field::new("x", DataType::Varchar, true)]);
         catalog.add_parquet("/data/x.parquet", schema.clone());
         assert_eq!(catalog.parquet_schema("/data/x.parquet").unwrap(), schema);
+        assert_eq!(catalog.parquet_rows("/data/x.parquet"), None);
+        catalog.set_parquet_rows("/data/x.parquet", 42);
+        assert_eq!(catalog.parquet_rows("/data/x.parquet"), Some(42));
         assert_eq!(
             catalog
                 .parquet_schema("/data/y.parquet")
