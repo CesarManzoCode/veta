@@ -6,7 +6,8 @@
 //! - [`database`]: the `--db` directory and its tables, the binder's catalog.
 //! - [`executor`]: runs a logical plan as pipelines of morsels over `--threads` workers.
 //! - [`load`]: Parquet and TSV into a table (`veta load`).
-//! - `pipeline`, `aggregate`, `sort`, `hash_table` and `group_keys`: the physical operators.
+//! - `pipeline`, `aggregate`, `join`, `sort`, `hash_table` and `group_keys`: the physical
+//!   operators.
 
 mod aggregate;
 pub mod context;
@@ -16,6 +17,7 @@ pub mod expr_eval;
 pub mod functions;
 mod group_keys;
 mod hash_table;
+mod join;
 pub mod like;
 pub mod load;
 mod pipeline;

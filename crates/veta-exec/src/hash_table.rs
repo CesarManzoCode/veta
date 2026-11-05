@@ -1,5 +1,5 @@
-//! Open-addressing hash tables of the aggregation (contract §12): one for fixed-width keys
-//! packed in `u64`/`u128` and one for byte strings kept in an arena.
+//! Open-addressing hash tables of the aggregation and of the hash join (contract §12): one
+//! for fixed-width keys packed in `u64`/`u128` and one for byte strings kept in an arena.
 //!
 //! Both assign consecutive ids `0, 1, …` in insertion order and probe linearly with at
 //! most half of the slots in use. The low bits of the hash pick the slot; the top bits
@@ -109,6 +109,22 @@ impl<K: FixedKey> FixedTable<K> {
         }
     }
 
+    /// The id of `key`, if the table has it.
+    #[inline]
+    pub fn find(&self, key: K) -> Option<u32> {
+        let mut slot = key.hash64() as usize & self.mask;
+        loop {
+            let id = self.ids[slot];
+            if id == 0 {
+                return None;
+            }
+            if self.keys[slot] == key {
+                return Some(id - 1);
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
     fn grow(&mut self) {
         let slots = self.ids.len() * 2;
         let mask = slots - 1;
@@ -208,6 +224,23 @@ impl BytesTable {
         }
     }
 
+    /// The id of `key`, whose hash is `hash`, if the table has it.
+    #[inline]
+    pub fn find(&self, key: &[u8], hash: u64) -> Option<u32> {
+        let tag = (hash >> 32) as u32;
+        let mut slot = hash as usize & self.mask;
+        loop {
+            let (id, slot_tag) = self.slots[slot];
+            if id == 0 {
+                return None;
+            }
+            if slot_tag == tag && self.key(id as usize - 1) == key {
+                return Some(id - 1);
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
     fn grow(&mut self) {
         let slots = self.slots.len() * 2;
         let mask = slots - 1;
@@ -278,6 +311,37 @@ mod tests {
             assert_eq!(table.hash(id as usize), hash_bytes(key));
         }
         assert_eq!(table.len(), 40 + 5000);
+    }
+
+    #[test]
+    fn find_returns_the_inserted_ids_and_nothing_else() {
+        let mut fixed = FixedTable::<u64>::with_slots(2);
+        let mut bytes = BytesTable::with_slots(2);
+        for key in 0..3000u64 {
+            let id = fixed.find_or_insert(key * 3);
+            assert_eq!(fixed.find(key * 3), Some(id));
+            let text = format!("key{key}");
+            let id = bytes.find_or_insert(text.as_bytes(), hash_bytes(text.as_bytes()));
+            assert_eq!(
+                bytes.find(text.as_bytes(), hash_bytes(text.as_bytes())),
+                Some(id)
+            );
+        }
+        for key in 0..3000u64 {
+            assert_eq!(fixed.find(key * 3), Some(key as u32));
+            assert_eq!(fixed.find(key * 3 + 1), None);
+            let text = format!("key{key}");
+            assert_eq!(
+                bytes.find(text.as_bytes(), hash_bytes(text.as_bytes())),
+                Some(key as u32)
+            );
+            let other = format!("other{key}");
+            assert_eq!(
+                bytes.find(other.as_bytes(), hash_bytes(other.as_bytes())),
+                None
+            );
+        }
+        assert_eq!(FixedTable::<u128>::with_slots(4).find(0), None);
     }
 
     #[test]

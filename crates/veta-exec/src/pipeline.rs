@@ -3,8 +3,9 @@
 //! A morsel is up to 16 contiguous granules of a part, a Parquet row group or one chunk
 //! already in memory. A [`Dispatcher`] hands out morsels with an atomic counter to the
 //! workers, plain `std::thread::scope` threads, so morsels are claimed in order. Filters
-//! narrow a selection vector instead of copying rows; projections evaluate over it. Every
-//! worker keeps its own sink state, which the operator combines after the join.
+//! narrow a selection vector instead of copying rows; projections evaluate over it; the
+//! probe of a join ([`crate::join`]) turns one batch into any number of batches. Every
+//! worker keeps its own sink state, which the operator combines after the threads end.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -21,6 +22,7 @@ use veta_storage::{PartReader, Snapshot, Table, detach_part};
 
 use crate::context::{ExecContext, add, new_reservation};
 use crate::expr_eval::CompiledExpr;
+use crate::join::JoinProbe;
 
 /// Granules per morsel of a stored table (contract §12).
 pub(crate) const MORSEL_GRANULES: usize = 16;
@@ -186,6 +188,8 @@ pub(crate) enum ProjectItem {
 pub(crate) enum StreamOp {
     Filter(CompiledExpr),
     Project(Vec<ProjectItem>),
+    /// The probe of a join whose build side is done.
+    Join(Box<JoinProbe>),
 }
 
 impl StreamOp {
@@ -235,6 +239,9 @@ impl StreamOp {
                 }
                 batch.chunk = Chunk::with_len(columns, rows)?;
                 batch.selection = None;
+            }
+            StreamOp::Join(_) => {
+                return Err(VetaError::internal("a join probe does not apply in place"));
             }
         }
         Ok(())
@@ -437,11 +444,25 @@ impl Pipeline {
     }
 
     fn push_chunk(&self, chunk: Chunk, sink: &mut dyn FnMut(Batch) -> Result<()>) -> Result<()> {
-        let mut batch = Batch {
+        let batch = Batch {
             chunk,
             selection: None,
         };
-        for op in &self.ops {
+        self.push_batch(0, batch, sink)
+    }
+
+    /// Runs `batch` through the operators from `first` on. Each batch a join probe emits
+    /// goes on through the operators after it.
+    fn push_batch(
+        &self,
+        first: usize,
+        mut batch: Batch,
+        sink: &mut dyn FnMut(Batch) -> Result<()>,
+    ) -> Result<()> {
+        for (i, op) in self.ops.iter().enumerate().skip(first) {
+            if let StreamOp::Join(join) = op {
+                return join.probe(batch, &mut |out| self.push_batch(i + 1, out, &mut *sink));
+            }
             op.apply(&mut batch)?;
             if batch.rows() == 0 {
                 return Ok(());
