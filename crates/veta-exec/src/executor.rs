@@ -6,14 +6,15 @@
 //! input, which probes (§12): left-deep join trees are one pipeline.
 //! `Scan` reads the columns the plan names, so the plan decides what is read (§11.2 rule 5),
 //! and skips the parts, granules and row groups its filters exclude unless `--no-prune`
-//! (§11.4).
+//! (§11.4). Under EXPLAIN ANALYZE each node counts its output rows: a streaming node with a
+//! counting operator right after it, a pipeline break on the rows it materialized (§11.6).
 
 use veta_core::memory::Reservation;
 use veta_core::{Chunk, Result, Schema};
-use veta_sql::LogicalPlan;
+use veta_sql::{Estimator, LogicalPlan, explain_json};
 
 use crate::aggregate;
-use crate::context::{ExecContext, ExecOptions, ExecStats};
+use crate::context::{ExecContext, ExecOptions, ExecStats, Profile, add};
 use crate::database::Database;
 use crate::join;
 use crate::pipeline::{Materialized, Pipeline, Source, StreamOp, collect, slice_chunks};
@@ -39,6 +40,7 @@ pub fn execute(
         threads: options.threads.max(1),
         stats,
         prune: options.prune,
+        profile: None,
     };
     let materialized = execute_plan(plan, &ctx)?;
     Ok(QueryResult {
@@ -48,9 +50,35 @@ pub fn execute(
     })
 }
 
+/// Executes `plan`, counting the rows of each node, and returns the JSON of §11.6 in place of
+/// the rows.
+pub fn explain_analyze(
+    db: &Database,
+    plan: &LogicalPlan,
+    options: &ExecOptions,
+    stats: &ExecStats,
+) -> Result<String> {
+    let profile = Profile::new(plan);
+    let ctx = ExecContext {
+        db,
+        threads: options.threads.max(1),
+        stats,
+        prune: options.prune,
+        profile: Some(&profile),
+    };
+    execute_plan(plan, &ctx)?;
+    let est_rows = Estimator::new(db).estimate_tree(plan);
+    Ok(explain_json(plan, &est_rows, Some(&profile.counts())))
+}
+
+/// The JSON of §11.6 without executing `plan`: every `actual_rows` is `null`.
+pub fn explain(db: &Database, plan: &LogicalPlan) -> String {
+    explain_json(plan, &Estimator::new(db).estimate_tree(plan), None)
+}
+
 /// Runs `plan` up to its pipeline break and materializes the output.
 fn execute_plan(plan: &LogicalPlan, ctx: &ExecContext<'_>) -> Result<Materialized> {
-    match plan {
+    let output = match plan {
         LogicalPlan::Aggregate {
             input,
             groups,
@@ -94,13 +122,35 @@ fn execute_plan(plan: &LogicalPlan, ctx: &ExecContext<'_>) -> Result<Materialize
         | LogicalPlan::SingleRow
         | LogicalPlan::Filter { .. }
         | LogicalPlan::Project { .. }
-        | LogicalPlan::Join { .. } => collect(build_pipeline(plan, ctx)?, ctx, None),
+        | LogicalPlan::Join { .. } => return collect(build_pipeline(plan, ctx)?, ctx, None),
+    }?;
+    if let Some(counter) = ctx.profile.and_then(|profile| profile.counter(plan)) {
+        let rows: usize = output.chunks.iter().map(|chunk| chunk.len).sum();
+        add(&counter, rows as u64);
     }
+    Ok(output)
 }
 
-/// The pipeline that ends at `plan`: its streaming operators over a source, which is the
-/// materialized output of the pipeline break below, if any.
+/// The pipeline that ends at `plan`, which under EXPLAIN ANALYZE counts the rows of a
+/// streaming node; a pipeline break counts its own in [`execute_plan`].
 fn build_pipeline(plan: &LogicalPlan, ctx: &ExecContext<'_>) -> Result<Pipeline> {
+    let mut pipeline = plan_pipeline(plan, ctx)?;
+    let streams = !matches!(
+        plan,
+        LogicalPlan::Aggregate { .. }
+            | LogicalPlan::Sort { .. }
+            | LogicalPlan::TopN { .. }
+            | LogicalPlan::Limit { .. }
+    );
+    if streams && let Some(counter) = ctx.profile.and_then(|profile| profile.counter(plan)) {
+        pipeline.push_op(StreamOp::Count(counter));
+    }
+    Ok(pipeline)
+}
+
+/// The streaming operators of `plan` over a source, which is the materialized output of the
+/// pipeline break below, if any.
+fn plan_pipeline(plan: &LogicalPlan, ctx: &ExecContext<'_>) -> Result<Pipeline> {
     match plan {
         LogicalPlan::Scan {
             table,
@@ -163,7 +213,7 @@ mod prune_tests;
 mod tests {
     use super::*;
     use veta_core::{DataType, Value, Vector};
-    use veta_sql::{OptimizerOptions, Statement, bind_query, optimize, parse_statement};
+    use veta_sql::{JoinOrder, OptimizerOptions, Statement, bind_query, optimize, parse_statement};
     use veta_storage::insert;
 
     fn database(tag: &str) -> (Database, std::path::PathBuf) {
@@ -313,7 +363,14 @@ mod tests {
         let Statement::Query(q) = parse_statement(sql)? else {
             panic!("not a query: {sql}");
         };
-        let plan = optimize(bind_query(db, &q)?, OptimizerOptions { enabled });
+        let plan = optimize(
+            bind_query(db, &q)?,
+            OptimizerOptions {
+                enabled,
+                ..Default::default()
+            },
+            db,
+        );
         let stats = ExecStats::default();
         let result = execute(
             db,
@@ -475,6 +532,174 @@ mod tests {
                 "more than one row returned by a subquery used as an expression"
             );
             assert_eq!(err.exit_code(), 1);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `(op, actual_rows)` of every node of the JSON of §11.6, in preorder.
+    fn actual_rows(json: &str) -> Vec<(String, u64)> {
+        json.split("{\"op\":\"")
+            .skip(1)
+            .map(|node| {
+                let (op, rest) = node.split_once('"').unwrap();
+                let (_, rest) = rest.split_once("\"actual_rows\":").unwrap();
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                (op.to_string(), digits.parse().unwrap())
+            })
+            .collect()
+    }
+
+    fn explained(db: &Database, sql: &str, threads: usize) -> String {
+        let Statement::Query(q) = parse_statement(sql).unwrap() else {
+            panic!("not a query: {sql}");
+        };
+        let plan = optimize(bind_query(db, &q).unwrap(), OptimizerOptions::default(), db);
+        let stats = ExecStats::default();
+        let options = ExecOptions {
+            threads,
+            prune: true,
+        };
+        explain_analyze(db, &plan, &options, &stats).unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+
+    #[test]
+    fn explain_analyze_counts_the_rows_of_each_node() {
+        let (db, dir) = join_tables("explain");
+        for threads in [1, 8] {
+            // a.k = b.k matches 1-1, 1-2, 2-3, 4-1 and 4-2.
+            assert_eq!(
+                actual_rows(&explained(
+                    &db,
+                    "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k",
+                    threads
+                )),
+                [("Project", 5u64), ("HashJoin", 5), ("Scan", 5), ("Scan", 5)]
+                    .map(|(op, rows)| (op.to_string(), rows))
+            );
+            let rows = actual_rows(&explained(
+                &db,
+                "SELECT k, count(*) FROM a WHERE id > 2 GROUP BY k ORDER BY k LIMIT 2",
+                threads,
+            ));
+            let of = |op: &str| {
+                rows.iter()
+                    .find(|(name, _)| name == op)
+                    .unwrap_or_else(|| panic!("no {op} in {rows:?}"))
+                    .1
+            };
+            // Rows with id 3, 4 and 5 have the keys NULL, 10 and 30.
+            assert_eq!(of("Scan"), 5);
+            assert_eq!(of("Filter"), 3);
+            assert_eq!(of("HashAggregate"), 3);
+            assert_eq!(of("TopN"), 2);
+            let rows = actual_rows(&explained(
+                &db,
+                "SELECT id FROM a WHERE k IN (SELECT k FROM b) LIMIT 2",
+                threads,
+            ));
+            assert_eq!(rows[0], ("Limit".to_string(), 2));
+            assert!(rows.iter().any(|(op, _)| op == "HashJoin"), "{rows:?}");
+        }
+        let json = explained(&db, "SELECT a.id FROM a, b", 2);
+        assert!(
+            json.contains("\"op\":\"NestedLoopJoin\",\"kind\":\"cross\""),
+            "{json}"
+        );
+        assert_eq!(actual_rows(&json)[0], ("Project".to_string(), 25));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn explain_without_analyze_does_not_execute() {
+        let (db, dir) = join_tables("explain-plain");
+        let Statement::Query(q) = parse_statement("SELECT id FROM a").unwrap() else {
+            panic!("not a query");
+        };
+        let plan = bind_query(&db, &q).unwrap();
+        let json = explain(&db, &plan);
+        assert!(json.contains("\"actual_rows\":null"), "{json}");
+        assert!(!json.contains("\"actual_rows\":5"), "{json}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Rows of `sql` under one set of optimizer options, sorted.
+    fn sorted_rows(db: &Database, sql: &str, options: OptimizerOptions) -> Vec<Vec<Value>> {
+        let Statement::Query(q) = parse_statement(sql).unwrap() else {
+            panic!("not a query: {sql}");
+        };
+        let plan = optimize(bind_query(db, &q).unwrap(), options, db);
+        let stats = ExecStats::default();
+        let exec = ExecOptions {
+            threads: 4,
+            prune: true,
+        };
+        let result = execute(db, &plan, &exec, &stats).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let mut rows: Vec<Vec<Value>> = result
+            .chunks
+            .iter()
+            .flat_map(|c| (0..c.len).map(move |i| c.row(i)))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// `r0(a, b) … r3(a, b)` of different sizes, with repeated values and NULLs in `b`.
+    fn reorder_tables(tag: &str) -> (Database, std::path::PathBuf) {
+        let (db, dir) = database(tag);
+        for (r, size) in [40i64, 300, 5, 90].into_iter().enumerate() {
+            let name = format!("r{r}");
+            create(
+                &db,
+                &format!("CREATE TABLE {name} (a BIGINT NOT NULL, b BIGINT, PRIMARY KEY (a))"),
+            );
+            let table = db.open_table(&name).unwrap();
+            let a: Vec<Value> = (0..size).map(Value::Int64).collect();
+            let b: Vec<Value> = (0..size)
+                .map(|i| {
+                    if i % 11 == 3 {
+                        Value::Null
+                    } else {
+                        Value::Int64(i % 7)
+                    }
+                })
+                .collect();
+            let chunk = Chunk::new(vec![
+                Vector::from_values(DataType::Int64, &a).unwrap(),
+                Vector::from_values(DataType::Int64, &b).unwrap(),
+            ])
+            .unwrap();
+            insert(&table, &chunk).unwrap();
+        }
+        (db, dir)
+    }
+
+    #[test]
+    fn every_join_order_returns_the_same_rows() {
+        let (db, dir) = reorder_tables("reorder");
+        let off = OptimizerOptions {
+            enabled: false,
+            ..Default::default()
+        };
+        let syntactic = OptimizerOptions {
+            join_order: JoinOrder::Syntactic,
+            ..Default::default()
+        };
+        for sql in [
+            "SELECT r0.a, r1.a, r2.a, r3.a FROM r0, r1, r2, r3 \
+             WHERE r0.a = r1.b AND r1.a = r2.b AND r2.a = r3.b",
+            "SELECT * FROM r1, r3, r2 WHERE r1.b = r3.b AND r3.a = r2.a AND r1.a > 5",
+            "SELECT r1.a, r2.a FROM r1, r2 WHERE r1.a < r2.a",
+            "SELECT r2.a, r1.a FROM r2, r1",
+            "SELECT r1.a, r2.b, r3.a FROM r1 JOIN r2 ON r1.a = r2.a \
+             LEFT JOIN r3 ON r2.b = r3.b JOIN r0 ON r1.a = r0.a",
+            "SELECT r1.a FROM r1, r3 WHERE r1.b = r3.b AND EXISTS \
+             (SELECT * FROM r2 WHERE r2.a = r1.a)",
+            "SELECT r1.b, count(*), sum(r3.a) FROM r1, r3, r2 \
+             WHERE r1.a = r3.a AND r3.b = r2.b AND r1.a + r2.a > r3.a GROUP BY r1.b",
+        ] {
+            let by_cost = sorted_rows(&db, sql, OptimizerOptions::default());
+            assert_eq!(by_cost, sorted_rows(&db, sql, syntactic), "{sql}");
+            assert_eq!(by_cost, sorted_rows(&db, sql, off), "{sql}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

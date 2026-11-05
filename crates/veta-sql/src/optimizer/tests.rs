@@ -67,7 +67,7 @@ fn bind(sql: &str) -> LogicalPlan {
 }
 
 fn optimized(sql: &str) -> LogicalPlan {
-    optimize(bind(sql), OptimizerOptions { enabled: true })
+    optimize(bind(sql), OptimizerOptions::default(), &catalog())
 }
 
 fn tree(plan: &LogicalPlan) -> String {
@@ -347,7 +347,14 @@ fn scan_filters_on_parquet_and_none_without_the_optimizer() {
             upper: Bound::Unbounded,
         }]
     );
-    let off = optimize(bind(sql), OptimizerOptions { enabled: false });
+    let off = optimize(
+        bind(sql),
+        OptimizerOptions {
+            enabled: false,
+            ..Default::default()
+        },
+        &catalog(),
+    );
     assert!(scan_filters(&off).is_empty());
 }
 
@@ -395,7 +402,14 @@ fn column_pruning_before_and_after() {
     assert_eq!(exprs[1].columns(), vec![0]);
 
     // Rule 5 also runs with the optimizer off.
-    let off = optimize(bind(sql), OptimizerOptions { enabled: false });
+    let off = optimize(
+        bind(sql),
+        OptimizerOptions {
+            enabled: false,
+            ..Default::default()
+        },
+        &catalog(),
+    );
     assert_eq!(tree(&off), tree(&after));
 }
 
@@ -463,7 +477,14 @@ fn sort_under_limit_becomes_top_n() {
     let only_offset = sort_limit_to_top_n(bind("SELECT UserID FROM hits ORDER BY UserID OFFSET 5"));
     assert!(tree(&only_offset).starts_with("Limit offset=5\n  Sort "));
     // Without the optimizer the Sort and the Limit stay.
-    let off = optimize(bind(sql), OptimizerOptions { enabled: false });
+    let off = optimize(
+        bind(sql),
+        OptimizerOptions {
+            enabled: false,
+            ..Default::default()
+        },
+        &catalog(),
+    );
     assert!(tree(&off).starts_with("Limit 10 offset=0\n  Sort "));
 }
 

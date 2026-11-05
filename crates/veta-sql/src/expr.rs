@@ -116,13 +116,21 @@ impl AggregateExpr {
     }
 
     pub fn to_sql(&self) -> String {
-        match &self.arg {
+        self.call_sql(self.arg.as_ref().map(BoundExpr::to_sql))
+    }
+
+    /// [`Self::to_sql`] with the columns as `columns` gives them (see [`BoundExpr::to_sql_over`]).
+    pub fn to_sql_over(&self, columns: &[String]) -> String {
+        self.call_sql(self.arg.as_ref().map(|arg| arg.to_sql_over(columns)))
+    }
+
+    fn call_sql(&self, arg: Option<String>) -> String {
+        match arg {
             None => "count(*)".into(),
             Some(arg) => format!(
-                "{}({}{})",
+                "{}({}{arg})",
                 self.func.name(),
                 if self.distinct { "DISTINCT " } else { "" },
-                arg.to_sql()
             ),
         }
     }
@@ -352,6 +360,27 @@ impl BoundExpr {
         let mut out = String::new();
         self.write_sql(&mut out);
         out
+    }
+
+    /// [`Self::to_sql`] with each column read as the text `columns` gives its index, so the
+    /// text speaks of what the input computes and not of its name in the query.
+    pub fn to_sql_over(&self, columns: &[String]) -> String {
+        fn rename(e: &mut BoundExpr, columns: &[String]) {
+            if let BoundExprKind::Column { index, name } = &mut e.kind {
+                *name = columns[*index].clone();
+                return;
+            }
+            if let BoundExprKind::AggregateRef { index, sql } = &mut e.kind {
+                *sql = columns[*index].clone();
+                return;
+            }
+            for child in e.children_mut() {
+                rename(child, columns);
+            }
+        }
+        let mut e = self.clone();
+        rename(&mut e, columns);
+        e.to_sql()
     }
 
     fn write_sql(&self, out: &mut String) {

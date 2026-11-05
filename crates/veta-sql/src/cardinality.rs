@@ -128,6 +128,18 @@ pub struct Estimator<'a> {
     bases: RefCell<Vec<Base>>,
 }
 
+/// Estimate of one input of a join tree being reordered (§11.2 rule 3). Its columns are the
+/// ones the caller asked for in [`Estimator::join_input`] and, after a join, the columns of
+/// the left input followed by those of the right one.
+#[derive(Debug, Clone)]
+pub struct JoinEstimate(Rel);
+
+impl JoinEstimate {
+    pub fn rows(&self) -> f64 {
+        self.0.rows
+    }
+}
+
 impl<'a> Estimator<'a> {
     pub fn new(catalog: &'a dyn Catalog) -> Estimator<'a> {
         Estimator {
@@ -151,6 +163,32 @@ impl<'a> Estimator<'a> {
         let mut trace = Vec::new();
         self.rel(plan, &mut trace);
         trace
+    }
+
+    /// Forgets the base relations met so far. The [`JoinEstimate`]s of one join tree must
+    /// come from the same period between resets.
+    pub fn reset(&self) {
+        self.bases.borrow_mut().clear();
+    }
+
+    /// Estimate of `plan` as an input of a join tree, with only the output `columns` that
+    /// the predicates of the tree read, in that order.
+    pub fn join_input(&self, plan: &LogicalPlan, columns: &[usize]) -> JoinEstimate {
+        let mut rel = self.rel(plan, &mut Vec::new());
+        rel.columns = columns.iter().map(|&c| rel.columns[c].clone()).collect();
+        JoinEstimate(rel)
+    }
+
+    /// Estimate of the inner join of two inputs; `keys` and `residual` are bound over the
+    /// columns of the estimates, as in a [`LogicalPlan::Join`].
+    pub fn inner_join(
+        &self,
+        left: &JoinEstimate,
+        right: &JoinEstimate,
+        keys: &[(BoundExpr, BoundExpr)],
+        residual: Option<&BoundExpr>,
+    ) -> JoinEstimate {
+        JoinEstimate(self.inner_rel(&left.0, &right.0, keys, residual))
     }
 
     fn table(&self, name: &str) -> Option<Rc<CatalogTable>> {
@@ -557,6 +595,22 @@ impl<'a> Estimator<'a> {
         }
     }
 
+    /// The inner join of `left` and `right`, residual included.
+    fn inner_rel(
+        &self,
+        left: &Rel,
+        right: &Rel,
+        keys: &[(BoundExpr, BoundExpr)],
+        residual: Option<&BoundExpr>,
+    ) -> Rel {
+        let rows = self.inner_rows(left, right, keys);
+        let rel = self.concat(left.clone(), right.clone(), rows);
+        match residual {
+            Some(r) => self.filter(rel, r.clone().into_conjuncts()),
+            None => rel,
+        }
+    }
+
     fn join(
         &self,
         left: Rel,
@@ -565,18 +619,10 @@ impl<'a> Estimator<'a> {
         keys: &[(BoundExpr, BoundExpr)],
         residual: Option<&BoundExpr>,
     ) -> Rel {
-        let inner = |left: &Rel, right: &Rel| {
-            let rows = self.inner_rows(left, right, keys);
-            let rel = self.concat(left.clone(), right.clone(), rows);
-            match residual {
-                Some(r) => self.filter(rel, r.clone().into_conjuncts()),
-                None => rel,
-            }
-        };
         match kind {
-            JoinKind::Inner | JoinKind::Cross => inner(&left, &right),
+            JoinKind::Inner | JoinKind::Cross => self.inner_rel(&left, &right, keys, residual),
             JoinKind::Left => {
-                let matched = inner(&left, &right).rows;
+                let matched = self.inner_rel(&left, &right, keys, residual).rows;
                 let rows = matched.max(left.rows);
                 let fill = if rows > 0.0 { matched / rows } else { 0.0 };
                 let right = null_extended(right, fill);

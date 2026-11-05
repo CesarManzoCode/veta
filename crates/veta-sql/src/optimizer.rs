@@ -3,14 +3,15 @@
 //! 1. constant folding and boolean simplification;
 //! 2. predicate pushdown through `Project` and joins (only to the preserved side of a
 //!    `Left` join, never from above into the side that supplies NULLs);
+//! 3. join graph reordering by estimated cost ([`join_order`]);
 //! 4. scan filters derived from single-table conjunctions (`col op literal`, `BETWEEN`,
 //!    `IN (literals)`), which prune parts, granules and Parquet row groups;
 //! 5. column pruning, so a scan reads only the columns something above it uses;
 //! 6. `Sort` under `Limit` becomes `TopN`.
 //!
-//! Rule 3 (join graph reordering) arrives with K2. With `--no-optimizer` only rule 5 runs
-//! (§11.3); the binder already builds joins in the connected syntactic order with the
-//! remaining predicates in a `Filter` above them.
+//! With `--no-optimizer` only rule 5 runs (§11.3). The binder already builds joins in the
+//! connected syntactic order with the remaining predicates in a `Filter` above them, so
+//! `--join-order syntactic` is rule 3 left out and the other rules on.
 
 use std::collections::BTreeSet;
 use std::ops::Bound;
@@ -18,28 +19,52 @@ use std::ops::Bound;
 use veta_core::predicate::ScanFilter;
 use veta_core::{DataType, Field, Schema, Value};
 
+use crate::catalog::Catalog;
 use crate::expr::{BinaryOp, BoundExpr, BoundExprKind, UnaryOp, cast_value};
 use crate::plan::{JoinKind, LogicalPlan};
+
+pub mod join_order;
+
+/// `--join-order` (contract §11.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinOrder {
+    /// Rule 3: DPccp or GOO over the estimated cost.
+    Cost,
+    /// The connected syntactic order the binder builds.
+    Syntactic,
+}
 
 /// What the optimizer does (contract §11.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OptimizerOptions {
     /// `false` with `--no-optimizer`: only column pruning runs.
     pub enabled: bool,
+    pub join_order: JoinOrder,
 }
 
 impl Default for OptimizerOptions {
     fn default() -> Self {
-        OptimizerOptions { enabled: true }
+        OptimizerOptions {
+            enabled: true,
+            join_order: JoinOrder::Cost,
+        }
     }
 }
 
-/// Applies the rules of §11.2 that `options` turns on, in their order.
-pub fn optimize(plan: LogicalPlan, options: OptimizerOptions) -> LogicalPlan {
+/// Applies the rules of §11.2 that `options` turns on, in their order. `catalog` supplies
+/// the statistics rule 3 estimates with.
+pub fn optimize(
+    plan: LogicalPlan,
+    options: OptimizerOptions,
+    catalog: &dyn Catalog,
+) -> LogicalPlan {
     let mut plan = plan;
     if options.enabled {
         plan = fold_constants(plan);
         plan = push_down_predicates(plan);
+        if options.join_order == JoinOrder::Cost {
+            plan = join_order::reorder_joins(plan, catalog);
+        }
         plan = derive_scan_filters(plan);
     }
     plan = prune_columns(plan);

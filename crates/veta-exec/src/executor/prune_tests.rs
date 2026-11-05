@@ -42,7 +42,7 @@ fn run(db: &Database, sql: &str, prune: bool) -> (Vec<Vec<Value>>, ExecStats) {
     let Statement::Query(q) = parse_statement(sql).unwrap() else {
         panic!("not a query: {sql}");
     };
-    let plan = optimize(bind_query(db, &q).unwrap(), OptimizerOptions::default());
+    let plan = optimize(bind_query(db, &q).unwrap(), OptimizerOptions::default(), db);
     let stats = ExecStats::default();
     let result = execute(db, &plan, &ExecOptions { threads: 4, prune }, &stats)
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -212,7 +212,11 @@ fn without_the_optimizer_nothing_is_pruned() {
     };
     let plan = optimize(
         bind_query(&t.db, &q).unwrap(),
-        OptimizerOptions { enabled: false },
+        OptimizerOptions {
+            enabled: false,
+            ..Default::default()
+        },
+        &t.db,
     );
     let stats = ExecStats::default();
     let on = execute(

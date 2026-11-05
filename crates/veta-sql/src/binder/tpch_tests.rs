@@ -9,6 +9,7 @@ use veta_core::{DataType, Field, Schema};
 use crate::ast::Statement;
 use crate::catalog::MemoryCatalog;
 use crate::expr::BoundExpr;
+use crate::optimizer::{JoinOrder, OptimizerOptions, optimize};
 use crate::parser::parse_statement;
 use crate::plan::{JoinKind, LogicalPlan};
 
@@ -758,6 +759,58 @@ fn unsupported_correlations() {
     assert!(e.contains("one column"), "{e}");
     let e = error("SELECT o_orderkey FROM orders WHERE o_custkey IN (SELECT * FROM customer)");
     assert!(e.contains("one column"), "{e}");
+}
+
+/// The joins and base relations of `plan`: `(left right)` for a join, the alias for a scan.
+fn join_shape(plan: &LogicalPlan) -> String {
+    match plan {
+        LogicalPlan::Join { left, right, .. } => {
+            format!("({} {})", join_shape(left), join_shape(right))
+        }
+        LogicalPlan::Scan { alias, .. } => alias.clone(),
+        other => other
+            .children()
+            .into_iter()
+            .map(join_shape)
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// §11.3: the next relation in `FROM` order with a join predicate into what is already joined.
+/// The bound plan is the plan of `--no-optimizer`, and `--join-order syntactic` keeps it.
+fn assert_connected_syntactic_order(sql: &str, expected: &str) {
+    assert_eq!(join_shape(&plan(sql)), expected, "{sql}");
+    let options = OptimizerOptions {
+        enabled: false,
+        join_order: JoinOrder::Syntactic,
+    };
+    let off = optimize(plan(sql), options, &tpch_catalog());
+    assert_eq!(join_shape(&off), expected, "{sql}");
+    let options = OptimizerOptions {
+        enabled: true,
+        join_order: JoinOrder::Syntactic,
+    };
+    let on = optimize(plan(sql), options, &tpch_catalog());
+    assert_eq!(join_shape(&on), expected, "{sql}");
+}
+
+#[test]
+fn q02_from_joins_in_the_connected_syntactic_order() {
+    // `supplier` has no predicate with `part`; `partsupp` does, and then `supplier` connects.
+    assert_connected_syntactic_order(
+        "SELECT s_acctbal, s_name, n_name, p_partkey, p_mfgr          FROM part, supplier, partsupp, nation, region          WHERE p_partkey = ps_partkey AND s_suppkey = ps_suppkey AND p_size = 15          AND p_type LIKE '%BRASS' AND s_nationkey = n_nationkey          AND n_regionkey = r_regionkey AND r_name = 'EUROPE'",
+        "((((part partsupp) supplier) nation) region)",
+    );
+}
+
+#[test]
+fn q09_from_joins_in_the_connected_syntactic_order() {
+    // `supplier` has no predicate with `part`; `lineitem` does, and the rest follow in order.
+    assert_connected_syntactic_order(
+        "SELECT n_name, o_orderdate, l_extendedprice          FROM part, supplier, lineitem, partsupp, orders, nation          WHERE s_suppkey = l_suppkey AND ps_suppkey = l_suppkey AND ps_partkey = l_partkey          AND p_partkey = l_partkey AND o_orderkey = l_orderkey AND s_nationkey = n_nationkey          AND p_name LIKE '%green%'",
+        "(((((part lineitem) supplier) partsupp) orders) nation)",
+    );
 }
 
 fn data_dir() -> std::path::PathBuf {

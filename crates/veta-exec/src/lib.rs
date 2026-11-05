@@ -26,6 +26,6 @@ mod sort;
 
 pub use context::{ExecOptions, ExecStats};
 pub use database::Database;
-pub use executor::{QueryResult, execute};
+pub use executor::{QueryResult, execute, explain, explain_analyze};
 pub use expr_eval::{CompiledExpr, cast_vector, eval, eval_predicate};
 pub use load::{LoadInput, LoadSummary, load};

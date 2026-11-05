@@ -10,6 +10,7 @@ use std::ops::Bound;
 use veta_core::predicate::ScanFilter;
 use veta_core::{Field, Schema};
 
+use crate::display::write_ident;
 use crate::expr::{AggregateExpr, BoundExpr, value_to_sql};
 
 /// Join kinds of §11.1. `Semi`, `Anti`, `NullAwareAnti` and `Single` come from the
@@ -279,6 +280,61 @@ impl LogicalPlan {
             | LogicalPlan::TopN { input, .. }
             | LogicalPlan::Limit { input, .. } => vec![&**input],
             LogicalPlan::Join { left, right, .. } => vec![&**left, &**right],
+        }
+    }
+
+    /// SQL text of each output column over the base relations below (§11.6): `alias.col` for
+    /// a scanned column, the expression for a computed one.
+    pub fn output_sql(&self) -> Vec<String> {
+        match self {
+            LogicalPlan::Scan { alias, schema, .. }
+            | LogicalPlan::ParquetScan { alias, schema, .. } => {
+                let mut qualifier = String::new();
+                let _ = write_ident(&mut qualifier, alias);
+                schema
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let mut column = format!("{qualifier}.");
+                        let _ = write_ident(&mut column, &f.name);
+                        column
+                    })
+                    .collect()
+            }
+            LogicalPlan::SingleRow => Vec::new(),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::TopN { input, .. }
+            | LogicalPlan::Limit { input, .. } => input.output_sql(),
+            LogicalPlan::Project { input, exprs, .. } => {
+                let columns = input.output_sql();
+                exprs.iter().map(|e| e.to_sql_over(&columns)).collect()
+            }
+            LogicalPlan::Aggregate {
+                input,
+                groups,
+                aggregates,
+                ..
+            } => {
+                let columns = input.output_sql();
+                groups
+                    .iter()
+                    .map(|g| g.to_sql_over(&columns))
+                    .chain(aggregates.iter().map(|a| a.to_sql_over(&columns)))
+                    .collect()
+            }
+            LogicalPlan::Join {
+                left, right, kind, ..
+            } => {
+                let mut columns = left.output_sql();
+                if !matches!(
+                    kind,
+                    JoinKind::Semi | JoinKind::Anti | JoinKind::NullAwareAnti
+                ) {
+                    columns.extend(right.output_sql());
+                }
+                columns
+            }
         }
     }
 

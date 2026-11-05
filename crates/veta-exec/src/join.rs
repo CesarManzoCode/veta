@@ -923,6 +923,7 @@ mod tests {
             threads,
             stats: &stats,
             prune: true,
+            profile: None,
         };
         let key_exprs: Vec<(BoundExpr, BoundExpr)> =
             keys.iter().map(|&(l, r)| (col(l, 0), col(r, 1))).collect();
@@ -1313,6 +1314,7 @@ mod tests {
             threads: 4,
             stats: &stats,
             prune: true,
+            profile: None,
         };
         let keys = vec![(col(0, 0), col(0, 1))];
         let probe = build(
@@ -1352,6 +1354,7 @@ mod tests {
             threads: 1,
             stats: &stats,
             prune: true,
+            profile: None,
         };
         let keys = vec![(col(0, 0), col(1, 1))];
         let err = build(

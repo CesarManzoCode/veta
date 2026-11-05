@@ -9,8 +9,8 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use veta_core::memory::Reservation;
 use veta_core::predicate::ScanFilter;
@@ -190,6 +190,8 @@ pub(crate) enum StreamOp {
     Project(Vec<ProjectItem>),
     /// The probe of a join whose build side is done.
     Join(Box<JoinProbe>),
+    /// Counts the rows that reach it (EXPLAIN ANALYZE, §11.6).
+    Count(Arc<AtomicU64>),
 }
 
 impl StreamOp {
@@ -240,6 +242,7 @@ impl StreamOp {
                 batch.chunk = Chunk::with_len(columns, rows)?;
                 batch.selection = None;
             }
+            StreamOp::Count(counter) => add(counter, batch.rows() as u64),
             StreamOp::Join(_) => {
                 return Err(VetaError::internal("a join probe does not apply in place"));
             }
@@ -728,6 +731,7 @@ mod tests {
             threads: 8,
             stats: &stats,
             prune: true,
+            profile: None,
         };
         let chunks: Vec<Chunk> = (0..200).map(|i| int_chunk(&[i, i + 1000])).collect();
         let out = collect(Pipeline::new(Source::chunks(chunks)), &ctx, None).unwrap();
@@ -748,6 +752,7 @@ mod tests {
                 threads,
                 stats: &stats,
                 prune: true,
+                profile: None,
             };
             let chunks: Vec<Chunk> = (0..500).map(|i| int_chunk(&[i])).collect();
             let out = collect(Pipeline::new(Source::chunks(chunks)), &ctx, Some(5)).unwrap();
@@ -766,6 +771,7 @@ mod tests {
             threads: 2,
             stats: &stats,
             prune: true,
+            profile: None,
         };
         let column = BoundExpr::column(0, "x", DataType::Int64, false);
         let predicate = BoundExpr::new(

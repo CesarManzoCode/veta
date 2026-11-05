@@ -987,3 +987,85 @@ fn reading_more_files_than_the_soft_limit_raises_it() {
     let first: Vec<String> = (0..20).map(|c| c.to_string()).collect();
     assert_eq!(lines[0], first.join("\t"));
 }
+
+/// Creates `name (id, k)` with `rows` and loads it.
+fn join_table(dir: &Path, db: &Path, name: &str, rows: &[(i64, Option<i64>)]) {
+    let create = format!("CREATE TABLE {name} (id BIGINT NOT NULL, k BIGINT, PRIMARY KEY (id))");
+    let done = veta(&["sql", "--db", text(db), &create]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    let tsv = dir.join(format!("{name}.tsv"));
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(id, k)| match k {
+            Some(k) => format!("{id}\t{k}\n"),
+            None => format!("{id}\t\\N\n"),
+        })
+        .collect();
+    fs::write(&tsv, lines.concat()).unwrap();
+    let done = veta(&[
+        "load",
+        "--db",
+        text(db),
+        "--table",
+        name,
+        "--tsv",
+        text(&tsv),
+    ]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+}
+
+#[test]
+fn join_orders_and_explain_analyze() {
+    let dir = test_dir("explain");
+    let db = dir.join("db");
+    join_table(
+        &dir,
+        &db,
+        "big",
+        &(0..200).map(|i| (i, Some(i % 5))).collect::<Vec<_>>(),
+    );
+    join_table(&dir, &db, "small", &[(0, Some(1)), (1, Some(3)), (2, None)]);
+    let sql = "SELECT big.id, small.id FROM small, big WHERE small.k = big.k ORDER BY 1, 2";
+    let run = |options: &[&str]| {
+        let mut args = vec!["sql", "--db", text(&db)];
+        args.extend_from_slice(options);
+        args.push(sql);
+        let out = veta(&args);
+        assert_eq!(out.status.code(), Some(0), "{options:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let by_cost = run(&[]);
+    assert_eq!(by_cost.lines().count(), 80);
+    assert_eq!(run(&["--join-order", "cost"]), by_cost);
+    assert_eq!(run(&["--join-order", "syntactic"]), by_cost);
+    assert_eq!(run(&["--no-optimizer"]), by_cost);
+
+    let json = run(&["--explain-analyze"]);
+    assert_eq!(json.lines().count(), 1, "{json}");
+    assert!(json.starts_with("{\"op\":\""), "{json}");
+    assert!(json.trim_end().ends_with('}'), "{json}");
+    assert!(
+        json.contains("\"op\":\"HashJoin\",\"kind\":\"inner\""),
+        "{json}"
+    );
+    assert!(json.contains("\"actual_rows\":80"), "{json}");
+    assert!(
+        json.contains("{\"alias\":\"big\",\"table\":\"big\"}"),
+        "{json}"
+    );
+    assert!(json.contains("\"(big.k = small.k)\""), "{json}");
+
+    let statement = format!("EXPLAIN ANALYZE {sql}");
+    let keyword = veta(&["sql", "--db", text(&db), &statement]);
+    assert_eq!(keyword.status.code(), Some(0), "{keyword:?}");
+    let keyword = String::from_utf8(keyword.stdout).unwrap();
+    assert_eq!(keyword.lines().count(), 1, "{keyword}");
+    assert!(keyword.contains("\"actual_rows\":80"), "{keyword}");
+
+    let statement = format!("EXPLAIN {sql}");
+    let plain = veta(&["sql", "--db", text(&db), &statement]);
+    assert_eq!(plain.status.code(), Some(0), "{plain:?}");
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    assert!(plain.contains("\"actual_rows\":null"), "{plain}");
+    assert!(!plain.contains("\"actual_rows\":80"), "{plain}");
+}

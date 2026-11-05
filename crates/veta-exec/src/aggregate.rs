@@ -1429,6 +1429,7 @@ mod tests {
             threads,
             stats: &stats,
             prune: true,
+            profile: None,
         };
         let pipeline = Pipeline::new(Source::chunks(chunks));
         let out = run(pipeline, groups, aggregates, &ctx).unwrap();

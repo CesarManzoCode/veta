@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use veta_core::error::{Result, VetaError};
 use veta_core::format;
 use veta_core::memory;
-use veta_exec::{Database, ExecOptions, ExecStats, LoadInput, execute};
-use veta_sql::{OptimizerOptions, Statement, bind_query, optimize, parse_statements};
+use veta_exec::{Database, ExecOptions, ExecStats, LoadInput, execute, explain, explain_analyze};
+use veta_sql::{JoinOrder, OptimizerOptions, Statement, bind_query, optimize, parse_statements};
 
 use args::Parsed;
 
@@ -168,18 +168,17 @@ fn cmd_sql(args: &[String]) -> Result<()> {
     let db = Database::open(parsed.required("--db")?);
     let threads = parse_threads(&parsed)?;
     let output_format = parse_format(&parsed)?;
-    if let Some(order) = parsed.value("--join-order")
-        && order != "cost"
-        && order != "syntactic"
-    {
-        return Err(VetaError::user(format!("invalid --join-order: {order}")));
-    }
+    let join_order = match parsed.value("--join-order") {
+        None | Some("cost") => JoinOrder::Cost,
+        Some("syntactic") => JoinOrder::Syntactic,
+        Some(order) => {
+            return Err(VetaError::user(format!("invalid --join-order: {order}")));
+        }
+    };
     if let Some(limit) = parsed.parsed::<u64>("--memory-limit-mb")? {
         memory::global().set_limit_mb(limit);
     }
-    if parsed.flag("--explain-analyze") {
-        return Err(VetaError::unsupported("--explain-analyze"));
-    }
+    let analyze_all = parsed.flag("--explain-analyze");
     let [sql] = parsed.positional() else {
         return Err(VetaError::user("sql takes exactly one statement"));
     };
@@ -188,10 +187,11 @@ fn cmd_sql(args: &[String]) -> Result<()> {
         return Err(VetaError::user("syntax error: empty statement"));
     }
     let stats = ExecStats::default();
-    // §11.3: `--no-optimizer` leaves only column pruning; `--no-prune` only stops the
-    // skipping of parts, granules and row groups.
+    // §11.3: `--no-optimizer` leaves only column pruning; `--join-order syntactic` only leaves
+    // out rule 3; `--no-prune` only stops the skipping of parts, granules and row groups.
     let optimizer = OptimizerOptions {
         enabled: !parsed.flag("--no-optimizer"),
+        join_order,
     };
     let options = ExecOptions {
         threads,
@@ -204,8 +204,13 @@ fn cmd_sql(args: &[String]) -> Result<()> {
             Statement::CreateTable(create) => {
                 db.create_table(create)?;
             }
+            Statement::Query(query) if analyze_all => {
+                let plan = optimize(bind_query(&db, query)?, optimizer, &db);
+                let json = explain_analyze(&db, &plan, &options, &stats)?;
+                write_stdout(&mut out, format!("{json}\n").as_bytes())?;
+            }
             Statement::Query(query) => {
-                let plan = optimize(bind_query(&db, query)?, optimizer);
+                let plan = optimize(bind_query(&db, query)?, optimizer, &db);
                 let result = execute(&db, &plan, &options, &stats)?;
                 let mut text = Vec::new();
                 if output_format == OutputFormat::TsvHeader {
@@ -224,7 +229,15 @@ fn cmd_sql(args: &[String]) -> Result<()> {
                 }
                 write_stdout(&mut out, &text)?;
             }
-            Statement::Explain { .. } => return Err(VetaError::unsupported("EXPLAIN")),
+            Statement::Explain { analyze, query } => {
+                let plan = optimize(bind_query(&db, query)?, optimizer, &db);
+                let json = if *analyze || analyze_all {
+                    explain_analyze(&db, &plan, &options, &stats)?
+                } else {
+                    explain(&db, &plan)
+                };
+                write_stdout(&mut out, format!("{json}\n").as_bytes())?;
+            }
         }
     }
     match out.flush() {
