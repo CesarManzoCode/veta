@@ -9,7 +9,7 @@ import resource
 import sys
 import traceback
 
-from harness import clickbench, fetch, meta, oracles, tpch
+from harness import clickbench, durability, fetch, meta, oracles, tpch
 from harness.config import paths
 from harness.report import EXIT_USAGE, FAIL, SKIP, Infra, Report, Skip
 
@@ -62,6 +62,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = commands.add_parser("codec-roundtrip", help="veta codec-roundtrip on random columns and on hits")
     p.set_defaults(func=clickbench.codec_roundtrip, report_name="codec-roundtrip")
+
+    p = commands.add_parser("merge-equivalence", help="the 43 ClickBench results before and after merge --final")
+    p.set_defaults(func=durability.merge_equivalence, report_name="merge-equivalence")
+
+    p = commands.add_parser("concurrent-reader", help="the 5 fixed queries while the merger runs")
+    p.add_argument("--iterations", type=durability.iteration_count,
+                   default=durability.DEFAULT_READER_ITERATIONS, metavar="N")
+    p.set_defaults(func=durability.concurrent_reader, report_name="concurrent-reader")
+
+    p = commands.add_parser("crash-merge", help="merge --final killed with SIGKILL, then recover")
+    p.add_argument("--iterations", type=durability.iteration_count,
+                   default=durability.DEFAULT_CRASH_ITERATIONS, metavar="N")
+    p.set_defaults(func=durability.crash_merge, report_name="crash-merge")
+
+    p = commands.add_parser("crash-insert", help="load --tsv killed with SIGKILL, then recover")
+    p.add_argument("--iterations", type=durability.iteration_count,
+                   default=durability.DEFAULT_CRASH_ITERATIONS, metavar="N")
+    p.set_defaults(func=durability.crash_insert, report_name="crash-insert")
+
+    p = commands.add_parser("corruption", help="one byte changed in each file type of a part")
+    p.set_defaults(func=durability.corruption, report_name="corruption")
 
     p = commands.add_parser("size", help="non-empty lines of the engine and of the harness")
     p.set_defaults(func=meta.size, report_name="size")
