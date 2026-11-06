@@ -26,7 +26,7 @@ mod sort;
 
 pub use context::{ExecOptions, ExecStats};
 pub use database::Database;
-pub use executor::{QueryResult, execute, explain, explain_analyze};
+pub use executor::{QueryResult, execute, execute_streaming, explain, explain_analyze};
 pub use expr_eval::{CompiledExpr, cast_vector, eval, eval_predicate};
 pub use load::{LoadInput, LoadSummary, load};
 pub use pipeline::keep_worker_error;

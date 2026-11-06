@@ -17,7 +17,7 @@ use crate::aggregate;
 use crate::context::{ExecContext, ExecOptions, ExecStats, Profile, add};
 use crate::database::Database;
 use crate::join;
-use crate::pipeline::{Materialized, Pipeline, Source, StreamOp, collect, slice_chunks};
+use crate::pipeline::{Materialized, Pipeline, Source, StreamOp, collect, slice_chunks, stream};
 use crate::sort;
 
 /// The rows of a query, in result order.
@@ -48,6 +48,26 @@ pub fn execute(
         chunks: materialized.chunks,
         _hold: materialized.hold,
     })
+}
+
+/// Executes `plan` and hands its chunks to `sink`, in result order, as they are ready. A plan
+/// whose top is a pipeline break materializes that break first; any other keeps in memory
+/// only the morsels on the way (`veta export`).
+pub fn execute_streaming(
+    db: &Database,
+    plan: &LogicalPlan,
+    options: &ExecOptions,
+    stats: &ExecStats,
+    sink: &mut (dyn FnMut(Chunk) -> Result<()> + Send),
+) -> Result<()> {
+    let ctx = ExecContext {
+        db,
+        threads: options.threads.max(1),
+        stats,
+        prune: options.prune,
+        profile: None,
+    };
+    stream(build_pipeline(plan, &ctx)?, &ctx, sink)
 }
 
 /// Executes `plan`, counting the rows of each node, and returns the JSON of §11.6 in place of
@@ -279,6 +299,40 @@ mod tests {
             insert(&table, &chunk).unwrap();
         }
         (db, dir)
+    }
+
+    #[test]
+    fn streaming_gives_the_rows_of_a_query_in_order() {
+        let (db, dir) = table_with_rows("stream");
+        for sql in [
+            "SELECT a, s FROM t",
+            "SELECT a FROM t WHERE a % 3 = 0",
+            "SELECT s, a FROM t ORDER BY a DESC",
+            "SELECT s, count(*) FROM t GROUP BY s ORDER BY s",
+            "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 2",
+            "SELECT a FROM t WHERE a < 0",
+            "SELECT 1 + 1",
+        ] {
+            let Statement::Query(q) = parse_statement(sql).unwrap() else {
+                panic!("not a query: {sql}");
+            };
+            let plan = bind_query(&db, &q).unwrap();
+            for threads in [1, 8] {
+                let options = ExecOptions {
+                    threads,
+                    prune: true,
+                };
+                let expected = query(&db, sql, threads).unwrap();
+                let mut rows = Vec::new();
+                execute_streaming(&db, &plan, &options, &ExecStats::default(), &mut |c| {
+                    rows.extend((0..c.len).map(|i| c.row(i)));
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(rows, expected, "{sql}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -22,6 +22,7 @@ Fuente única de lo que veta no demuestra. Ningún otro archivo repite estos lí
 - Las cadenas son bytes: `length` y `substring` cuentan bytes, no caracteres.
 - `Timestamp` tiene resolución de segundos.
 - Parquet: sin tipos anidados ni REPEATED, sin INT96, sin cifrado, sin bloom filters ni page index; compresión solo UNCOMPRESSED y SNAPPY (no ZSTD, GZIP, LZ4, LZ4_RAW ni BROTLI), así que no lee los Parquet por omisión de ClickHouse (zstd). Una página con niveles en BIT_PACKED es un error; solo se tolera que un chunk la liste en sus codificaciones.
+- Escritura Parquet: un column chunk con algún NaN no lleva `min_value` ni `max_value` (solo `null_count`), así que sus grupos de filas no se saltan por esa columna; §9 pide esos campos en todo chunk, pero el formato prohíbe un NaN como cota. Un chunk sin valores (todo NULL) tampoco los lleva y, con `dict`, se escribe en PLAIN porque no hay nada que poner en el diccionario. Una columna de cadenas de más de 4 GiB en un grupo de filas se escribe, pero el lector de veta la rechaza. No se escribe `crc` de página, bloom filters ni page index. Las columnas de un archivo se codifican en un solo hilo.
 
 ## Alcance de la evidencia
 

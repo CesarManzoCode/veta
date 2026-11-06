@@ -8,9 +8,9 @@
 //! worker keeps its own sink state, which the operator combines after the threads end.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use veta_core::memory::Reservation;
 use veta_core::predicate::ScanFilter;
@@ -632,6 +632,105 @@ pub(crate) fn collect(
     })
 }
 
+/// Sink that hands the rows to `sink` in morsel order as they are ready, without keeping
+/// them: a worker waits before starting a morsel too far ahead of the next one to deliver,
+/// so at most two morsels per worker are in memory. The morsel to deliver is always running
+/// or done, and a failure or a panic wakes everyone, so no worker waits forever. `sink` runs
+/// under the lock, one chunk at a time. An error of `sink` ends the run with that error.
+pub(crate) fn stream(
+    pipeline: Pipeline,
+    ctx: &ExecContext<'_>,
+    sink: &mut (dyn FnMut(Chunk) -> Result<()> + Send),
+) -> Result<()> {
+    struct Delivery<'s> {
+        next: usize,
+        ready: BTreeMap<usize, Vec<Chunk>>,
+        failed: bool,
+        sink: &'s mut (dyn FnMut(Chunk) -> Result<()> + Send),
+    }
+    /// Marks the run as failed if its worker panics.
+    struct PanicGuard<'g, 's> {
+        delivery: &'g Mutex<Delivery<'s>>,
+        advanced: &'g Condvar,
+        dispatcher: &'g Dispatcher,
+    }
+    impl Drop for PanicGuard<'_, '_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.dispatcher.stop();
+                let mut delivery = self.delivery.lock().unwrap_or_else(PoisonError::into_inner);
+                delivery.failed = true;
+                self.advanced.notify_all();
+            }
+        }
+    }
+    fn poisoned<T>(_: PoisonError<T>) -> VetaError {
+        VetaError::internal("delivery lock poisoned")
+    }
+    let workers = ctx.threads.min(pipeline.source.morsels()).max(1);
+    let window = workers * 2;
+    let delivery = Mutex::new(Delivery {
+        next: 0,
+        ready: BTreeMap::new(),
+        failed: false,
+        sink,
+    });
+    let advanced = Condvar::new();
+    let dispatcher = &pipeline.dispatcher;
+    let fail = |err: VetaError| -> VetaError {
+        dispatcher.stop();
+        delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .failed = true;
+        advanced.notify_all();
+        err
+    };
+    join_workers(workers, || -> Result<()> {
+        let _guard = PanicGuard {
+            delivery: &delivery,
+            advanced: &advanced,
+            dispatcher,
+        };
+        while let Some(m) = dispatcher.next() {
+            {
+                let mut state = delivery.lock().map_err(poisoned)?;
+                while !state.failed && m >= state.next + window {
+                    state = advanced.wait(state).map_err(poisoned)?;
+                }
+                if state.failed {
+                    return Ok(());
+                }
+            }
+            let mut chunks = Vec::new();
+            pipeline
+                .run_morsel(m, ctx, &mut |batch| {
+                    chunks.push(batch.into_chunk());
+                    Ok(())
+                })
+                .map_err(&fail)?;
+            let mut state = delivery.lock().map_err(poisoned)?;
+            state.ready.insert(m, chunks);
+            loop {
+                let next = state.next;
+                let Some(ready) = state.ready.remove(&next) else {
+                    break;
+                };
+                for chunk in ready {
+                    if let Err(err) = (state.sink)(chunk) {
+                        drop(state);
+                        return Err(fail(err));
+                    }
+                }
+                state.next += 1;
+            }
+            advanced.notify_all();
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
 /// Rows `offset..offset + limit` of `chunks`.
 pub(crate) fn slice_chunks(chunks: Vec<Chunk>, offset: u64, limit: Option<u64>) -> Vec<Chunk> {
     let mut skip = offset;
@@ -771,6 +870,96 @@ mod tests {
             let out = collect(Pipeline::new(Source::chunks(chunks)), &ctx, Some(5)).unwrap();
             let values = first_column(&slice_chunks(out.chunks, 0, Some(5)));
             assert_eq!(values, (0..5).map(Value::Int64).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn stream_delivers_in_morsel_order_with_many_threads() {
+        let db = Database::open("unused");
+        let stats = ExecStats::default();
+        for threads in [1, 2, 8] {
+            let ctx = ExecContext {
+                db: &db,
+                threads,
+                stats: &stats,
+                prune: true,
+                profile: None,
+            };
+            let chunks: Vec<Chunk> = (0..500).map(|i| int_chunk(&[i, i + 1000])).collect();
+            let mut seen = Vec::new();
+            stream(Pipeline::new(Source::chunks(chunks)), &ctx, &mut |chunk| {
+                seen.push(chunk);
+                Ok(())
+            })
+            .unwrap();
+            let expected: Vec<Value> = (0..500)
+                .flat_map(|i| [Value::Int64(i), Value::Int64(i + 1000)])
+                .collect();
+            assert_eq!(first_column(&seen), expected);
+        }
+    }
+
+    #[test]
+    fn stream_with_morsels_that_emit_nothing_goes_on() {
+        use veta_sql::expr::BinaryOp;
+        let db = Database::open("unused");
+        let stats = ExecStats::default();
+        let ctx = ExecContext {
+            db: &db,
+            threads: 4,
+            stats: &stats,
+            prune: true,
+            profile: None,
+        };
+        let predicate = BoundExpr::new(
+            BoundExprKind::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(BoundExpr::column(0, "x", DataType::Int64, false)),
+                right: Box::new(BoundExpr::literal(Value::Int64(195))),
+            },
+            DataType::Boolean,
+            false,
+        );
+        let chunks: Vec<Chunk> = (0..200).map(|i| int_chunk(&[i])).collect();
+        let mut pipeline = Pipeline::new(Source::chunks(chunks));
+        pipeline.push_op(StreamOp::filter(&predicate).unwrap());
+        let mut seen = Vec::new();
+        stream(pipeline, &ctx, &mut |chunk| {
+            seen.push(chunk);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            first_column(&seen),
+            (196..200).map(Value::Int64).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stream_ends_with_the_error_of_its_sink() {
+        let db = Database::open("unused");
+        let stats = ExecStats::default();
+        for threads in [1, 8] {
+            let ctx = ExecContext {
+                db: &db,
+                threads,
+                stats: &stats,
+                prune: true,
+                profile: None,
+            };
+            let chunks: Vec<Chunk> = (0..500).map(|i| int_chunk(&[i])).collect();
+            let mut seen = 0;
+            let err = stream(Pipeline::new(Source::chunks(chunks)), &ctx, &mut |_| {
+                seen += 1;
+                if seen == 10 {
+                    Err(VetaError::user("full"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(err.to_string(), "full");
+            assert_eq!(seen, 10);
         }
     }
 

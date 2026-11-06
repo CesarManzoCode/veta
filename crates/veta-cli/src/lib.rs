@@ -1,11 +1,10 @@
 //! Subcommand dispatch for the `veta` binary (contract §13).
-//!
-//! `export` and `parquet-meta` answer `unsupported` until K3.
 
 mod args;
 mod codec_tools;
 pub mod fd_limit;
 mod merge_tools;
+mod parquet_tools;
 mod table_tools;
 
 use std::io::{self, BufWriter, Write};
@@ -91,9 +90,8 @@ pub fn run(args: &[String]) -> Result<()> {
         Some(Subcommand::DumpColumns) => table_tools::cmd_dump_columns(rest),
         Some(Subcommand::CodecRoundtrip) => codec_tools::cmd_codec_roundtrip(rest),
         Some(Subcommand::CodecBench) => codec_tools::cmd_codec_bench(rest),
-        Some(sub @ (Subcommand::Export | Subcommand::ParquetMeta)) => {
-            Err(VetaError::User(format!("unsupported: {}", sub.name())))
-        }
+        Some(Subcommand::Export) => parquet_tools::cmd_export(rest),
+        Some(Subcommand::ParquetMeta) => parquet_tools::cmd_parquet_meta(rest),
         None => Err(VetaError::User(format!(
             "unknown subcommand: {first}\n{}",
             usage()
@@ -293,15 +291,6 @@ mod tests {
     }
 
     #[test]
-    fn subcommands_of_k3_are_unsupported_with_exit_1() {
-        for sub in [Subcommand::Export, Subcommand::ParquetMeta] {
-            let err = run(&args(&[sub.name(), "--db", "x"])).unwrap_err();
-            assert_eq!(err.to_string(), format!("unsupported: {}", sub.name()));
-            assert_eq!(err.exit_code(), 1);
-        }
-    }
-
-    #[test]
     fn missing_or_unknown_subcommand_is_a_user_error() {
         assert_eq!(run(&[]).unwrap_err().exit_code(), 1);
         let err = run(&args(&["frobnicate"])).unwrap_err();
@@ -360,6 +349,77 @@ mod tests {
             &["merger"],
             &["merger", "--db", "d", "--interval-ms", "x"],
             &["merger", "--db", "d", "--final"],
+            &["export", "--db", "d", "--out", "f"],
+            &["export", "--db", "d", "--sql", "SELECT 1"],
+            &["export", "--sql", "SELECT 1", "--out", "f"],
+            &[
+                "export", "--db", "d", "--sql", "SELECT 1", "--out", "f", "x",
+            ],
+            &["export", "--db", "d", "--sql", "", "--out", "f"],
+            &[
+                "export",
+                "--db",
+                "d",
+                "--sql",
+                "SELECT 1; SELECT 2",
+                "--out",
+                "f",
+            ],
+            &[
+                "export",
+                "--db",
+                "d",
+                "--sql",
+                "EXPLAIN SELECT 1",
+                "--out",
+                "f",
+            ],
+            &[
+                "export",
+                "--db",
+                "d",
+                "--sql",
+                "SELECT 1",
+                "--out",
+                "f",
+                "--encoding",
+                "rle",
+            ],
+            &[
+                "export",
+                "--db",
+                "d",
+                "--sql",
+                "SELECT 1",
+                "--out",
+                "f",
+                "--compression",
+                "zstd",
+            ],
+            &[
+                "export",
+                "--db",
+                "d",
+                "--sql",
+                "SELECT 1",
+                "--out",
+                "f",
+                "--page-version",
+                "3",
+            ],
+            &[
+                "export",
+                "--db",
+                "d",
+                "--sql",
+                "SELECT 1",
+                "--out",
+                "f",
+                "--row-group-rows",
+                "0",
+            ],
+            &["parquet-meta"],
+            &["parquet-meta", "--file", "f", "extra"],
         ] {
             let err = run(&args(bad)).unwrap_err();
             assert_eq!(err.exit_code(), 1, "{bad:?}: {err}");

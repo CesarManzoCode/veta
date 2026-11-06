@@ -498,15 +498,22 @@ impl ParquetFile {
         })
     }
 
-    /// `(min, max, null count)` of a column chunk, for row-group skipping (contract §9):
-    /// `min_value`/`max_value` and, when both are missing, the legacy `min`/`max` only for
-    /// signed integers and dates. `None` when any of the three is unknown or unusable
-    /// (a NaN bound, a value of the wrong size).
+    /// `(min, max, null count)` of a column chunk, for row-group skipping (contract §9).
+    /// `None` when any of the three is unknown or unusable.
     pub fn row_group_stats(&self, row_group: usize, column: usize) -> Option<(Value, Value, u64)> {
+        let md = self.chunk_meta(row_group, column).ok()?;
+        let nulls = u64::try_from(md.statistics.as_ref()?.null_count?).ok()?;
+        let (min, max) = self.chunk_bounds(row_group, column)?;
+        Some((min, max, nulls))
+    }
+
+    /// `(min, max)` of a column chunk as veta values: `min_value`/`max_value` and, when both
+    /// are missing, the legacy `min`/`max` only for signed integers and dates (contract §9).
+    /// `None` when they are missing or unusable (a NaN bound, a value of the wrong size).
+    pub fn chunk_bounds(&self, row_group: usize, column: usize) -> Option<(Value, Value)> {
         let md = self.chunk_meta(row_group, column).ok()?;
         let info = self.columns.get(column)?;
         let stats = md.statistics.as_ref()?;
-        let nulls = u64::try_from(stats.null_count?).ok()?;
         let (min, max) = match (&stats.min_value, &stats.max_value) {
             (Some(min), Some(max)) => (min, max),
             (None, None) if info.convert.trusts_legacy_stats() => {
@@ -514,9 +521,7 @@ impl ParquetFile {
             }
             _ => return None,
         };
-        let min = stat_value(info, min)?;
-        let max = stat_value(info, max)?;
-        Some((min, max, nulls))
+        Some((stat_value(info, min)?, stat_value(info, max)?))
     }
 }
 
