@@ -1,10 +1,11 @@
 //! Subcommand dispatch for the `veta` binary (contract §13).
 //!
-//! `merge`, `merger`, `export` and `parquet-meta` answer `unsupported` until K3.
+//! `export` and `parquet-meta` answer `unsupported` until K3.
 
 mod args;
 mod codec_tools;
 pub mod fd_limit;
+mod merge_tools;
 mod table_tools;
 
 use std::io::{self, BufWriter, Write};
@@ -82,18 +83,17 @@ pub fn run(args: &[String]) -> Result<()> {
     match Subcommand::parse(first) {
         Some(Subcommand::Sql) => cmd_sql(rest),
         Some(Subcommand::Load) => cmd_load(rest),
+        Some(Subcommand::Merge) => merge_tools::cmd_merge(rest),
+        Some(Subcommand::Merger) => merge_tools::cmd_merger(rest),
         Some(Subcommand::Recover) => table_tools::cmd_recover(rest),
         Some(Subcommand::Check) => table_tools::cmd_check(rest),
         Some(Subcommand::Parts) => table_tools::cmd_parts(rest),
         Some(Subcommand::DumpColumns) => table_tools::cmd_dump_columns(rest),
         Some(Subcommand::CodecRoundtrip) => codec_tools::cmd_codec_roundtrip(rest),
         Some(Subcommand::CodecBench) => codec_tools::cmd_codec_bench(rest),
-        Some(
-            sub @ (Subcommand::Merge
-            | Subcommand::Merger
-            | Subcommand::Export
-            | Subcommand::ParquetMeta),
-        ) => Err(VetaError::User(format!("unsupported: {}", sub.name()))),
+        Some(sub @ (Subcommand::Export | Subcommand::ParquetMeta)) => {
+            Err(VetaError::User(format!("unsupported: {}", sub.name())))
+        }
         None => Err(VetaError::User(format!(
             "unknown subcommand: {first}\n{}",
             usage()
@@ -294,12 +294,7 @@ mod tests {
 
     #[test]
     fn subcommands_of_k3_are_unsupported_with_exit_1() {
-        for sub in [
-            Subcommand::Merge,
-            Subcommand::Merger,
-            Subcommand::Export,
-            Subcommand::ParquetMeta,
-        ] {
+        for sub in [Subcommand::Export, Subcommand::ParquetMeta] {
             let err = run(&args(&[sub.name(), "--db", "x"])).unwrap_err();
             assert_eq!(err.to_string(), format!("unsupported: {}", sub.name()));
             assert_eq!(err.exit_code(), 1);
@@ -340,6 +335,31 @@ mod tests {
                 "--parquet",
                 "b",
             ],
+            &["merge", "--db", "d"],
+            &["merge", "--table", "t"],
+            &[
+                "merge",
+                "--db",
+                "d",
+                "--table",
+                "t",
+                "--max-merge-rows",
+                "x",
+            ],
+            &[
+                "merge",
+                "--db",
+                "d",
+                "--table",
+                "t",
+                "--merge-memory-mb",
+                "-1",
+            ],
+            &["merge", "--db", "d", "--table", "t", "extra"],
+            &["merge", "--db", "d", "--table", "no_such_table"],
+            &["merger"],
+            &["merger", "--db", "d", "--interval-ms", "x"],
+            &["merger", "--db", "d", "--final"],
         ] {
             let err = run(&args(bad)).unwrap_err();
             assert_eq!(err.exit_code(), 1, "{bad:?}: {err}");

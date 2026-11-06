@@ -2,8 +2,9 @@
 //!
 //! 1. Exclusive `flock` of `.insert.lock`; the block number is one more than the larger of
 //!    `block_number.txt` and the largest `max_block` present; `block_number.txt` is
-//!    rewritten (tmp, fsync, rename) and the lock released.
-//! 2. `tmp_insert_<b>/` is created and its `owner.lock` locked exclusively until the end.
+//!    rewritten (tmp, fsync, rename).
+//! 2. `tmp_insert_<b>/` is created and its `owner.lock` locked exclusively until the end;
+//!    `.insert.lock` is released.
 //! 3. The part is written with every file and the directory fsynced.
 //! 4. `rename(tmp_insert_<b>, all_<b>_<b>_0)` and fsync of the table directory.
 //!
@@ -12,15 +13,20 @@
 //! `owner.lock`; it is removed right away (its descriptor stays locked until the end), and
 //! recovery removes it should the process die in between, because removing it before the
 //! rename would let a concurrent recovery take a fresh `owner.lock` of a live `tmp_*`.
+//!
+//! §6.1 releases `.insert.lock` before step 2. Here it is released after it, so a block
+//! number is never assigned without its `tmp_insert_<b>` being visible: a merge choosing
+//! its window under that lock ([`crate::merge`]) must not span a block still being
+//! written, or the part published later would be covered, and so lost, at birth.
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use veta_core::{Chunk, Result, Schema, VetaError};
 
 use crate::fsutil::{io_err, remove_dir_all_if_exists, sync_dir, write_atomic};
-use crate::locks::lock_exclusive;
+use crate::locks::{FileLock, lock_exclusive};
 use crate::part::{OWNER_LOCK, PartName, PartWriter, list_parts};
 use crate::sort::sort_chunk;
 use crate::table::{BLOCK_NUMBER_TXT, INSERT_LOCK, TMP_INSERT_PREFIX, Table};
@@ -73,9 +79,8 @@ fn read_block_number(path: &Path) -> Result<u64> {
         .map_err(|_| VetaError::Io(format!("{}: block number out of range", path.display())))
 }
 
-/// Step 1 of §6.1: assigns the next block number under `.insert.lock`.
-pub fn allocate_block_number(table: &Table) -> Result<u64> {
-    let _lock = lock_exclusive(&table.lock_path(INSERT_LOCK))?;
+/// Assigns the next block number; the caller holds `.insert.lock`.
+fn next_block_number(table: &Table) -> Result<u64> {
     let path = table.dir().join(BLOCK_NUMBER_TXT);
     let watermark = read_block_number(&path)?;
     let present = list_parts(table.dir())?
@@ -91,6 +96,22 @@ pub fn allocate_block_number(table: &Table) -> Result<u64> {
     Ok(block)
 }
 
+/// Steps 1 and 2 of §6.1: the block number, its temporary directory and its held
+/// `owner.lock`, all under `.insert.lock`.
+fn begin_insert(table: &Table) -> Result<(u64, PathBuf, FileLock)> {
+    let _lock = lock_exclusive(&table.lock_path(INSERT_LOCK))?;
+    let block = next_block_number(table)?;
+    let tmp = table.dir().join(format!("{TMP_INSERT_PREFIX}{block}"));
+    fs::create_dir(&tmp).map_err(|e| io_err(&tmp, e))?;
+    match lock_exclusive(&tmp.join(OWNER_LOCK)) {
+        Ok(owner) => Ok((block, tmp, owner)),
+        Err(err) => {
+            let _ = remove_dir_all_if_exists(&tmp);
+            Err(err)
+        }
+    }
+}
+
 /// Inserts `chunk` as one new part; returns its name, or `None` for an empty batch.
 pub fn insert(table: &Table, chunk: &Chunk) -> Result<Option<PartName>> {
     check_batch(table.schema(), chunk)?;
@@ -100,17 +121,8 @@ pub fn insert(table: &Table, chunk: &Chunk) -> Result<Option<PartName>> {
     let sorted = sort_chunk(chunk, table.primary_key())?;
     let rows = sorted.as_ref().unwrap_or(chunk);
 
-    let block = allocate_block_number(table)?;
+    let (block, tmp, owner) = begin_insert(table)?;
     let name = PartName::new(block, block, 0);
-    let tmp = table.dir().join(format!("{TMP_INSERT_PREFIX}{block}"));
-    fs::create_dir(&tmp).map_err(|e| io_err(&tmp, e))?;
-    let owner = match lock_exclusive(&tmp.join(OWNER_LOCK)) {
-        Ok(lock) => lock,
-        Err(err) => {
-            let _ = remove_dir_all_if_exists(&tmp);
-            return Err(err);
-        }
-    };
     let result = write_and_publish(table, &tmp, name, rows);
     if result.is_err() {
         let _ = remove_dir_all_if_exists(&tmp);
@@ -130,6 +142,12 @@ fn write_and_publish(table: &Table, tmp: &Path, name: PartName, rows: &Chunk) ->
     )?;
     writer.write(rows)?;
     writer.finish()?;
+    publish_part(table, tmp, name)
+}
+
+/// Renames the finished `tmp` to its part name, fsyncs the table directory and removes the
+/// `owner.lock` it carried along (step 4 of §6.1, step 3 of §6.2).
+pub(crate) fn publish_part(table: &Table, tmp: &Path, name: PartName) -> Result<()> {
     let dest = table.dir().join(name.to_string());
     fs::rename(tmp, &dest).map_err(|e| io_err(&dest, e))?;
     sync_dir(table.dir())?;
@@ -145,6 +163,7 @@ mod tests {
     use super::*;
     use crate::fsutil::subdirectories;
     use crate::fsutil::testdir::TestDir;
+    use crate::locks::try_lock_exclusive;
     use crate::part::PartReader;
     use crate::part::tests::write_part;
     use crate::table::tests::sample_def;
@@ -197,6 +216,20 @@ mod tests {
             let reader = PartReader::open(&dir, &schema, table.primary_key()).unwrap();
             assert_eq!(reader.rows(), 1);
         }
+    }
+
+    #[test]
+    fn a_block_number_comes_with_its_visible_held_tmp_dir() {
+        let db = TestDir::new("insert-begin");
+        let table = Table::create(db.path(), sample_def("t")).unwrap();
+        let (block, tmp, owner) = begin_insert(&table).unwrap();
+        assert_eq!(block, 1);
+        assert_eq!(tmp, table.dir().join("tmp_insert_1"));
+        assert!(try_lock_exclusive(&tmp.join(OWNER_LOCK)).unwrap().is_none());
+        // `.insert.lock` is free again, so the next insert can start.
+        let (block, _, _second) = begin_insert(&table).unwrap();
+        assert_eq!(block, 2);
+        drop(owner);
     }
 
     #[test]

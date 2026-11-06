@@ -18,8 +18,9 @@
 //! - `checksums.txt`: `<file>\t<bytes>\t<crc32c hex>` per other file and a last line
 //!   `self\t<crc32c of the previous lines>`.
 //!
-//! [`PartWriter`] writes all of them and fsyncs every file and the directory; publishing
-//! the directory (the `rename` of §6.1) is the caller's job. [`PartReader::open`] checks
+//! [`PartWriter`] writes all of them, whole rows or one column at a time, and fsyncs every
+//! file and the directory; publishing the directory (the `rename` of §6.1) is the caller's
+//! job. [`PartReader::open`] checks
 //! `checksums.txt`, the presence and size of every file, the full CRC32C of every file but
 //! the `c<N>.bin`, and the consistency of `part.txt`, the marks, the index, the stats and the
 //! sample with the table schema. [`PartReader::read_granule`] checks each block against its
@@ -186,30 +187,39 @@ struct ColumnFile {
     offset: u64,
     crc: u32,
     marks: Vec<u64>,
+    stats: ColumnStats,
+    /// Rows accepted so far.
+    received: u64,
+    /// Rows already in blocks.
+    written: u64,
+    /// Rows waiting to fill a granule.
+    pending: Vector,
+    sample: Vector,
+    sample_next: usize,
+    /// Position of this column in the primary key.
+    key_position: Option<usize>,
 }
 
 /// Writes one part into an existing (temporary) directory from rows that are already
 /// sorted by the primary key.
 ///
-/// The total row count is given up front so the systematic sample can be taken while the
-/// rows stream through; [`PartWriter::finish`] fails if a different number arrived.
+/// Rows arrive whole ([`PartWriter::write`]) or column by column, as the vertical merge
+/// sends them ([`PartWriter::write_column`] per column and [`PartWriter::add_key_rows`]
+/// for the key prefix HLLs); both produce the same files. The total row count is given up
+/// front so the systematic sample can be taken while the rows stream through;
+/// [`PartWriter::finish`] fails if a different number arrived.
 pub struct PartWriter {
     dir: PathBuf,
     name: PartName,
     schema: Schema,
     primary_key: Vec<usize>,
     rows: u64,
-    received: u64,
-    written: u64,
-    pending: Chunk,
+    key_rows: u64,
     files: Vec<ColumnFile>,
-    stats: Vec<ColumnStats>,
     prefix_hll: Vec<Hll>,
     index: Vec<Vector>,
     last_key: Vec<Vector>,
     sample_positions: Vec<u64>,
-    sample_next: usize,
-    sample: Chunk,
     buf: Vec<u8>,
 }
 
@@ -233,6 +243,7 @@ impl PartWriter {
                 "primary key column {bad} out of range"
             )));
         }
+        let types = schema.data_types();
         let mut files = Vec::with_capacity(schema.len());
         for column in 0..schema.len() {
             let path = dir.join(bin_file(column));
@@ -243,9 +254,15 @@ impl PartWriter {
                 offset: 0,
                 crc: 0,
                 marks: vec![0],
+                stats: ColumnStats::new(),
+                received: 0,
+                written: 0,
+                pending: Vector::with_capacity(types[column], 0),
+                sample: Vector::with_capacity(types[column], 0),
+                sample_next: 0,
+                key_position: primary_key.iter().position(|&c| c == column),
             });
         }
-        let types = schema.data_types();
         let key_vector = |&c: &usize| Vector::with_capacity(types[c], 0);
         Ok(PartWriter {
             dir: dir.to_path_buf(),
@@ -253,17 +270,12 @@ impl PartWriter {
             schema: schema.clone(),
             primary_key: primary_key.to_vec(),
             rows,
-            received: 0,
-            written: 0,
-            pending: Chunk::empty(&types),
+            key_rows: 0,
             files,
-            stats: vec![ColumnStats::new(); schema.len()],
             prefix_hll: vec![Hll::new(); primary_key.len()],
             index: primary_key.iter().map(key_vector).collect(),
             last_key: primary_key.iter().map(key_vector).collect(),
             sample_positions: sample_positions(rows),
-            sample_next: 0,
-            sample: Chunk::empty(&types),
             buf: Vec::new(),
         })
     }
@@ -278,28 +290,55 @@ impl PartWriter {
         if chunk.len == 0 {
             return Ok(());
         }
-        for (stats, vector) in self.stats.iter_mut().zip(&chunk.columns) {
-            update_column_stats(stats, vector, &row_hashes(vector));
-        }
         let key: Vec<&Vector> = self.primary_key.iter().map(|&c| chunk.column(c)).collect();
-        update_prefix_hlls(&mut self.prefix_hll, &key);
-        self.received += chunk.len as u64;
+        self.add_key_rows(&key)?;
+        for (column, vector) in chunk.columns.iter().enumerate() {
+            self.append_column(column, vector)?;
+        }
+        Ok(())
+    }
 
-        let mut offset = 0;
-        while offset < chunk.len {
-            let left = chunk.len - offset;
-            if self.pending.len == 0 && left >= GRANULE_ROWS {
-                self.flush_granule(&chunk.slice(offset, GRANULE_ROWS))?;
-                offset += GRANULE_ROWS;
-            } else {
-                let take = left.min(GRANULE_ROWS - self.pending.len);
-                self.pending.extend(&chunk.slice(offset, take))?;
-                offset += take;
-                if self.pending.len == GRANULE_ROWS {
-                    self.flush_pending()?;
-                }
+    /// Appends rows of one column, which continue that column's previous ones. Every
+    /// column must end up with the part's rows and in the same row order.
+    pub fn write_column(&mut self, column: usize, vector: &Vector) -> Result<()> {
+        self.check_column(column, vector)?;
+        self.append_column(column, vector)
+    }
+
+    /// Adds rows of the key columns (in key order) to the key prefix HLLs, which depend on
+    /// the columns of a row together. Their order among themselves does not matter, so the
+    /// vertical merge passes them as it loads them from each source.
+    pub fn add_key_rows(&mut self, key: &[&Vector]) -> Result<()> {
+        if key.len() != self.primary_key.len() {
+            return Err(VetaError::internal(format!(
+                "{} key columns for a key of {}",
+                key.len(),
+                self.primary_key.len()
+            )));
+        }
+        let Some(first) = key.first() else {
+            return Ok(());
+        };
+        for (vector, &c) in key.iter().zip(&self.primary_key) {
+            let data_type = self.schema.field(c).data_type;
+            if vector.len() != first.len() || vector.data_type() != data_type {
+                return Err(VetaError::internal(format!(
+                    "key column {} got {} {} rows, expected {} {data_type} rows",
+                    self.schema.field(c).name,
+                    vector.len(),
+                    vector.data_type(),
+                    first.len()
+                )));
             }
         }
+        if self.key_rows + first.len() as u64 > self.rows {
+            return Err(VetaError::internal(format!(
+                "part {} was declared with {} rows and got more key rows",
+                self.name, self.rows
+            )));
+        }
+        self.key_rows += first.len() as u64;
+        update_prefix_hlls(&mut self.prefix_hll, key);
         Ok(())
     }
 
@@ -312,23 +351,35 @@ impl PartWriter {
                 self.schema.len()
             )));
         }
-        for (vector, field) in chunk.columns.iter().zip(&self.schema.fields) {
-            if vector.data_type() != field.data_type {
-                return Err(VetaError::internal(format!(
-                    "column {} is {}, got a {} vector",
-                    field.name,
-                    field.data_type,
-                    vector.data_type()
-                )));
-            }
-            if !field.nullable && vector.null_count() > 0 {
-                return Err(VetaError::internal(format!(
-                    "NULL in NOT NULL column {}",
-                    field.name
-                )));
-            }
+        for (column, vector) in chunk.columns.iter().enumerate() {
+            self.check_column(column, vector)?;
         }
-        if self.received + chunk.len as u64 > self.rows {
+        Ok(())
+    }
+
+    fn check_column(&self, column: usize, vector: &Vector) -> Result<()> {
+        let (Some(field), Some(file)) = (self.schema.fields.get(column), self.files.get(column))
+        else {
+            return Err(VetaError::internal(format!(
+                "column {column} out of range in part {}",
+                self.name
+            )));
+        };
+        if vector.data_type() != field.data_type {
+            return Err(VetaError::internal(format!(
+                "column {} is {}, got a {} vector",
+                field.name,
+                field.data_type,
+                vector.data_type()
+            )));
+        }
+        if !field.nullable && vector.null_count() > 0 {
+            return Err(VetaError::internal(format!(
+                "NULL in NOT NULL column {}",
+                field.name
+            )));
+        }
+        if file.received + vector.len() as u64 > self.rows {
             return Err(VetaError::internal(format!(
                 "part {} was declared with {} rows and got more",
                 self.name, self.rows
@@ -337,57 +388,93 @@ impl PartWriter {
         Ok(())
     }
 
-    fn flush_pending(&mut self) -> Result<()> {
-        let types = self.schema.data_types();
-        let granule = mem::replace(&mut self.pending, Chunk::empty(&types));
-        self.flush_granule(&granule)
+    /// Updates the statistics of `column` and cuts its rows into granules.
+    fn append_column(&mut self, column: usize, vector: &Vector) -> Result<()> {
+        let len = vector.len();
+        let file = &mut self.files[column];
+        update_column_stats(&mut file.stats, vector, &row_hashes(vector));
+        file.received += len as u64;
+
+        let mut offset = 0;
+        while offset < len {
+            let left = len - offset;
+            let pending = self.files[column].pending.len();
+            if pending == 0 && left >= GRANULE_ROWS {
+                let slice = (len != GRANULE_ROWS).then(|| vector.slice(offset, GRANULE_ROWS));
+                self.flush_granule(column, slice.as_ref().unwrap_or(vector))?;
+                offset += GRANULE_ROWS;
+            } else {
+                let take = left.min(GRANULE_ROWS - pending);
+                self.files[column]
+                    .pending
+                    .extend(&vector.slice(offset, take))?;
+                offset += take;
+                if self.files[column].pending.len() == GRANULE_ROWS {
+                    self.flush_pending(column)?;
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Writes one granule: a block per column, the marks, the index entries and the
-    /// sample rows that fall inside it.
-    fn flush_granule(&mut self, granule: &Chunk) -> Result<()> {
-        let len = granule.len;
-        for (file, vector) in self.files.iter_mut().zip(&granule.columns) {
-            self.buf.clear();
-            write_block(vector, &mut self.buf)?;
-            file.bin
-                .write_all(&self.buf)
-                .map_err(|e| io_err(&file.path, e))?;
-            file.crc = crc32c_append(file.crc, &self.buf);
-            file.offset += self.buf.len() as u64;
-            file.marks.push(file.offset);
+    fn flush_pending(&mut self, column: usize) -> Result<()> {
+        let data_type = self.schema.field(column).data_type;
+        let empty = Vector::with_capacity(data_type, 0);
+        let granule = mem::replace(&mut self.files[column].pending, empty);
+        self.flush_granule(column, &granule)
+    }
+
+    /// Writes one granule of `column`: its block, its mark, its index entries if it is a
+    /// key column and the sample rows that fall inside it.
+    fn flush_granule(&mut self, column: usize, granule: &Vector) -> Result<()> {
+        let len = granule.len();
+        let file = &mut self.files[column];
+        self.buf.clear();
+        write_block(granule, &mut self.buf)?;
+        file.bin
+            .write_all(&self.buf)
+            .map_err(|e| io_err(&file.path, e))?;
+        file.crc = crc32c_append(file.crc, &self.buf);
+        file.offset += self.buf.len() as u64;
+        file.marks.push(file.offset);
+        if let Some(j) = file.key_position {
+            self.index[j].extend(&granule.slice(0, 1))?;
+            self.last_key[j] = granule.slice(len - 1, 1);
         }
-        for (j, &c) in self.primary_key.iter().enumerate() {
-            let column = granule.column(c);
-            self.index[j].extend(&column.slice(0, 1))?;
-            self.last_key[j] = column.slice(len - 1, 1);
-        }
-        let start = self.written;
+        let start = file.written;
         let end = start + len as u64;
         let mut picks = Vec::new();
-        while let Some(&pos) = self.sample_positions.get(self.sample_next) {
+        while let Some(&pos) = self.sample_positions.get(file.sample_next) {
             if pos >= end {
                 break;
             }
             picks.push((pos - start) as u32);
-            self.sample_next += 1;
+            file.sample_next += 1;
         }
         if !picks.is_empty() {
-            self.sample.extend(&granule.gather(&picks))?;
+            file.sample.extend(&granule.gather(&picks))?;
         }
-        self.written = end;
+        file.written = end;
         Ok(())
     }
 
     /// Writes the remaining files, fsyncs each of them and the directory.
     pub fn finish(mut self) -> Result<PartMeta> {
-        if self.pending.len > 0 {
-            self.flush_pending()?;
+        for column in 0..self.files.len() {
+            if !self.files[column].pending.is_empty() {
+                self.flush_pending(column)?;
+            }
+            if self.files[column].written != self.rows {
+                return Err(VetaError::internal(format!(
+                    "part {} was declared with {} rows and got {}",
+                    self.name, self.rows, self.files[column].written
+                )));
+            }
         }
-        if self.written != self.rows {
+        if !self.primary_key.is_empty() && self.key_rows != self.rows {
             return Err(VetaError::internal(format!(
-                "part {} was declared with {} rows and got {}",
-                self.name, self.rows, self.written
+                "part {} was declared with {} rows and got {} key rows",
+                self.name, self.rows, self.key_rows
             )));
         }
         let granules = granule_count(self.rows);
@@ -403,6 +490,8 @@ impl PartWriter {
         }
         self.write_file(PRIMARY_IDX, &idx, &mut written)?;
 
+        let mut stats = Vec::new();
+        let mut sample = Vec::new();
         for (column, mut file) in mem::take(&mut self.files).into_iter().enumerate() {
             file.bin.flush().map_err(|e| io_err(&file.path, e))?;
             file.bin
@@ -412,12 +501,11 @@ impl PartWriter {
             written.push((bin_file(column), file.offset, file.crc));
             let marks: Vec<u8> = file.marks.iter().flat_map(|m| m.to_le_bytes()).collect();
             self.write_file(&mrk_file(column), &marks, &mut written)?;
+            file.stats
+                .encode(self.schema.field(column).data_type, &mut stats)?;
+            write_block(&file.sample, &mut sample)?;
         }
 
-        let mut stats = Vec::new();
-        for (column, field) in self.stats.iter().zip(&self.schema.fields) {
-            column.encode(field.data_type, &mut stats)?;
-        }
         for hll in &self.prefix_hll {
             stats.extend_from_slice(hll.registers());
         }
@@ -425,10 +513,6 @@ impl PartWriter {
         stats.extend_from_slice(&crc.to_le_bytes());
         self.write_file(STATS_BIN, &stats, &mut written)?;
 
-        let mut sample = Vec::new();
-        for column in &self.sample.columns {
-            write_block(column, &mut sample)?;
-        }
         self.write_file(SAMPLE_BIN, &sample, &mut written)?;
 
         let mut checksums = String::new();
@@ -1145,7 +1229,7 @@ pub(crate) mod tests {
         dir
     }
 
-    fn assert_vectors_equal(a: &Vector, b: &Vector, what: &str) {
+    pub(crate) fn assert_vectors_equal(a: &Vector, b: &Vector, what: &str) {
         assert_eq!(a.len(), b.len(), "{what}");
         assert_eq!(a.data_type(), b.data_type(), "{what}");
         for i in 0..a.len() {
@@ -1456,5 +1540,87 @@ pub(crate) mod tests {
         assert!(writer.finish().is_err());
         let mut writer = PartWriter::create(&path, name, &schema, &[], 5).unwrap();
         assert!(writer.write(&chunk).is_err());
+    }
+
+    #[test]
+    fn writing_column_by_column_produces_the_same_files() {
+        let dir = TestDir::new("part-vertical");
+        let schema = all_types_schema();
+        let key = [14, 2];
+        let rows = 20_000;
+        let chunk = random_chunk(&schema, rows, 31);
+        let sorted = crate::sort::sort_chunk(&chunk, &key)
+            .unwrap()
+            .unwrap_or(chunk);
+        let name = PartName::new(1, 2, 1);
+        let whole = write_part(
+            &dir.path().join("whole"),
+            name,
+            &schema,
+            &key,
+            &sorted,
+            3000,
+        );
+
+        let vertical = dir.path().join("vertical");
+        fs::create_dir_all(&vertical).unwrap();
+        let mut writer = PartWriter::create(&vertical, name, &schema, &key, rows as u64).unwrap();
+        // The key rows may come in another order and the columns in other pieces.
+        let half = rows / 2;
+        for (offset, len) in [(half, rows - half), (0, half)] {
+            let piece = sorted.slice(offset, len);
+            let columns: Vec<&Vector> = key.iter().map(|&c| piece.column(c)).collect();
+            writer.add_key_rows(&columns).unwrap();
+        }
+        for column in (0..schema.len()).rev() {
+            for (offset, len) in [
+                (0, GRANULE_ROWS),
+                (GRANULE_ROWS, 1),
+                (GRANULE_ROWS + 1, rows - GRANULE_ROWS - 1),
+            ] {
+                writer
+                    .write_column(column, &sorted.column(column).slice(offset, len))
+                    .unwrap();
+            }
+        }
+        writer.finish().unwrap();
+
+        for entry in fs::read_dir(&whole).unwrap() {
+            let file = entry.unwrap().file_name();
+            assert_eq!(
+                fs::read(whole.join(&file)).unwrap(),
+                fs::read(vertical.join(&file)).unwrap(),
+                "{file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn column_writes_are_checked() {
+        let dir = TestDir::new("part-vertical-checks");
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int64, true),
+        ]);
+        let chunk = random_chunk(&schema, 10, 2);
+        let name = PartName::new(1, 1, 0);
+        let path = dir.path().join(name.to_string());
+        fs::create_dir_all(&path).unwrap();
+        let mut writer = PartWriter::create(&path, name, &schema, &[0], 10).unwrap();
+        assert!(writer.write_column(2, chunk.column(0)).is_err());
+        assert!(writer.write_column(0, chunk.column(1)).is_err());
+        assert!(writer.add_key_rows(&[]).is_err());
+        assert!(writer.add_key_rows(&[chunk.column(1)]).is_err());
+        writer.write_column(0, chunk.column(0)).unwrap();
+        assert!(writer.write_column(0, chunk.column(0)).is_err());
+        // A column or the key rows missing is an error at the end.
+        let mut writer = PartWriter::create(&path, name, &schema, &[0], 10).unwrap();
+        writer.add_key_rows(&[chunk.column(0)]).unwrap();
+        writer.write_column(0, chunk.column(0)).unwrap();
+        assert!(writer.finish().is_err());
+        let mut writer = PartWriter::create(&path, name, &schema, &[0], 10).unwrap();
+        writer.write_column(0, chunk.column(0)).unwrap();
+        writer.write_column(1, chunk.column(1)).unwrap();
+        assert!(writer.finish().is_err());
     }
 }

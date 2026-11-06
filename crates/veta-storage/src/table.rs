@@ -25,6 +25,7 @@ pub const DETACHED_DIR: &str = "detached";
 /// Prefix of every part under construction (`tmp_insert_<b>`, `tmp_merge_<name>`).
 pub const TMP_PREFIX: &str = "tmp_";
 pub const TMP_INSERT_PREFIX: &str = "tmp_insert_";
+pub const TMP_MERGE_PREFIX: &str = "tmp_merge_";
 /// Prefix of a part being deleted.
 pub const DELETE_TMP_PREFIX: &str = "delete_tmp_";
 

@@ -21,13 +21,13 @@ enum KeySlice<'a> {
     Str { offsets: &'a [u32], bytes: &'a [u8] },
 }
 
-struct SortKey<'a> {
+pub(crate) struct SortKey<'a> {
     values: KeySlice<'a>,
     validity: Option<&'a Bitmap>,
 }
 
 impl<'a> SortKey<'a> {
-    fn new(vector: &'a Vector) -> SortKey<'a> {
+    pub(crate) fn new(vector: &'a Vector) -> SortKey<'a> {
         let values = match &vector.data {
             VectorData::Boolean(v) => KeySlice::Bool(v),
             VectorData::Int16(v) => KeySlice::I16(v),
@@ -46,26 +46,40 @@ impl<'a> SortKey<'a> {
     }
 
     fn cmp(&self, a: usize, b: usize) -> Ordering {
-        if let Some(validity) = self.validity {
-            match (validity.get(a), validity.get(b)) {
-                (true, true) => {}
-                (false, false) => return Ordering::Equal,
-                (false, true) => return Ordering::Greater,
-                (true, false) => return Ordering::Less,
-            }
+        self.cmp_with(a, self, b)
+    }
+
+    /// Compares row `a` of this column with row `b` of `other`, a column of the same type.
+    #[inline]
+    pub(crate) fn cmp_with(&self, a: usize, other: &SortKey<'_>, b: usize) -> Ordering {
+        match (
+            self.validity.is_none_or(|v| v.get(a)),
+            other.validity.is_none_or(|v| v.get(b)),
+        ) {
+            (true, true) => {}
+            (false, false) => return Ordering::Equal,
+            (false, true) => return Ordering::Greater,
+            (true, false) => return Ordering::Less,
         }
-        match &self.values {
-            KeySlice::Bool(v) => v[a].cmp(&v[b]),
-            KeySlice::I16(v) => v[a].cmp(&v[b]),
-            KeySlice::I32(v) => v[a].cmp(&v[b]),
-            KeySlice::I64(v) => v[a].cmp(&v[b]),
-            KeySlice::I128(v) => v[a].cmp(&v[b]),
-            KeySlice::F64(v) => cmp_f64(v[a], v[b]),
-            KeySlice::Str { offsets, bytes } => {
+        match (&self.values, &other.values) {
+            (KeySlice::Bool(x), KeySlice::Bool(y)) => x[a].cmp(&y[b]),
+            (KeySlice::I16(x), KeySlice::I16(y)) => x[a].cmp(&y[b]),
+            (KeySlice::I32(x), KeySlice::I32(y)) => x[a].cmp(&y[b]),
+            (KeySlice::I64(x), KeySlice::I64(y)) => x[a].cmp(&y[b]),
+            (KeySlice::I128(x), KeySlice::I128(y)) => x[a].cmp(&y[b]),
+            (KeySlice::F64(x), KeySlice::F64(y)) => cmp_f64(x[a], y[b]),
+            (
+                KeySlice::Str { offsets, bytes },
+                KeySlice::Str {
+                    offsets: other_offsets,
+                    bytes: other_bytes,
+                },
+            ) => {
                 let sa = &bytes[offsets[a] as usize..offsets[a + 1] as usize];
-                let sb = &bytes[offsets[b] as usize..offsets[b + 1] as usize];
+                let sb = &other_bytes[other_offsets[b] as usize..other_offsets[b + 1] as usize];
                 sa.cmp(sb)
             }
+            _ => unreachable!("the key columns of a table have one type"),
         }
     }
 }
@@ -157,6 +171,26 @@ mod tests {
             assert_eq!(got[3], row[3], "stability at row {i}");
         }
         assert!(sort_chunk(&sorted, &key).unwrap().is_none());
+    }
+
+    #[test]
+    fn rows_of_two_vectors_compare_in_value_order() {
+        let values = [
+            Value::varchar(""),
+            Value::varchar("a"),
+            Value::varchar("ab"),
+            Value::Null,
+        ];
+        let left = Vector::from_values(DataType::Varchar, &values).unwrap();
+        let mut reversed = values.clone();
+        reversed.reverse();
+        let right = Vector::from_values(DataType::Varchar, &reversed).unwrap();
+        let (x, y) = (SortKey::new(&left), SortKey::new(&right));
+        for a in 0..values.len() {
+            for b in 0..reversed.len() {
+                assert_eq!(x.cmp_with(a, &y, b), values[a].cmp(&reversed[b]), "{a} {b}");
+            }
+        }
     }
 
     #[test]

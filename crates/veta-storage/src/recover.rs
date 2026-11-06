@@ -75,6 +75,22 @@ pub fn detach_part(table_dir: &Path, name: PartName) -> Result<Option<PathBuf>> 
     Ok(Some(target))
 }
 
+/// Removes part `name` from the table in `table_dir`: renames it to `delete_tmp_<name>`, so
+/// a crash leaves only what step (a) cleans, and deletes that. The caller holds the
+/// exclusive `.readers.lock`. `false` if the part was already gone.
+pub(crate) fn delete_covered_part(table_dir: &Path, name: PartName) -> Result<bool> {
+    let src = table_dir.join(name.to_string());
+    let doomed = table_dir.join(format!("{DELETE_TMP_PREFIX}{name}"));
+    match fs::rename(&src, &doomed) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(io_err(&src, e)),
+    }
+    sync_dir(table_dir)?;
+    remove_dir_all_if_exists(&doomed)?;
+    Ok(true)
+}
+
 /// Opens `name` with every check of §6.4 (no column file kept open). `Ok(Some(reason))`
 /// if it is broken, `Ok(None)` if it is fine or vanished.
 fn verify_part(table: &Table, name: PartName) -> Result<Option<String>> {
@@ -145,16 +161,9 @@ pub fn recover(table: &Table) -> Result<RecoveryReport> {
             }
         };
         for name in covered {
-            let src = dir.join(name.to_string());
-            let doomed = dir.join(format!("{DELETE_TMP_PREFIX}{name}"));
-            match fs::rename(&src, &doomed) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(io_err(&src, e)),
+            if delete_covered_part(dir, name)? {
+                report.removed_covered.push(name);
             }
-            sync_dir(dir)?;
-            remove_dir_all_if_exists(&doomed)?;
-            report.removed_covered.push(name);
         }
         sync_dir(dir)?;
     }

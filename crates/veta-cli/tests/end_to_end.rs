@@ -5,7 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use veta_core::datetime::format_date;
 use veta_core::decimal;
@@ -909,9 +910,204 @@ fn codec_tools_and_column_dump() {
     );
 }
 
+/// The lines of `parts` for table `t`.
+fn active_parts(db: &Path) -> Vec<String> {
+    let done = veta(&["parts", "--db", text(db), "--table", "t"]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    String::from_utf8(done.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The directories of table `t` that are neither parts nor `detached`.
+fn leftover_dirs(db: &Path) -> Vec<String> {
+    fs::read_dir(db.join("t"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with("all_") && name != "detached")
+        .collect()
+}
+
+#[test]
+fn merge_final_leaves_one_part_with_the_same_rows() {
+    let rows = generate_rows(41, 30_000);
+    let db = loaded_database("merge-final", &rows);
+    let all = "SELECT * FROM t";
+    let by_group = "SELECT grp, count(*), sum(val) FROM t GROUP BY grp ORDER BY grp";
+    let before = sorted(sql(&db, "2", all));
+    let groups = sql(&db, "2", by_group);
+    assert_eq!(before.len(), rows.len());
+    assert!(active_parts(&db).len() > 2);
+
+    let done = veta(&["merge", "--db", text(&db), "--table", "t", "--final"]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    let stdout = String::from_utf8(done.stdout).unwrap();
+    assert!(stdout.ends_with("1 active parts\n"), "{stdout}");
+
+    let parts = active_parts(&db);
+    assert_eq!(parts.len(), 1, "{parts:?}");
+    let fields: Vec<&str> = parts[0].split('\t').collect();
+    assert_eq!(fields[1], rows.len().to_string());
+    assert!(leftover_dirs(&db).is_empty());
+    assert_eq!(sorted(sql(&db, "2", all)), before);
+    assert_eq!(sql(&db, "2", by_group), groups);
+    let check = veta(&["check", "--db", text(&db), "--table", "t"]);
+    assert_eq!(check.status.code(), Some(0), "{check:?}");
+    fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn merge_follows_its_limits() {
+    let rows = generate_rows(42, 30_000);
+    let db = loaded_database("merge-limits", &rows);
+    let parts = active_parts(&db).len();
+
+    let done = veta(&[
+        "merge",
+        "--db",
+        text(&db),
+        "--table",
+        "t",
+        "--max-merge-rows",
+        "1",
+    ]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    assert_eq!(active_parts(&db).len(), parts);
+
+    // `--final` ignores the row limit but not the memory limit.
+    let done = veta(&[
+        "merge",
+        "--db",
+        text(&db),
+        "--table",
+        "t",
+        "--final",
+        "--merge-memory-mb",
+        "0",
+    ]);
+    assert_eq!(done.status.code(), Some(1), "{done:?}");
+    assert_eq!(active_parts(&db).len(), parts);
+    let done = veta(&[
+        "merge",
+        "--db",
+        text(&db),
+        "--table",
+        "t",
+        "--final",
+        "--max-merge-rows",
+        "1",
+    ]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    assert_eq!(active_parts(&db).len(), 1);
+    fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn merge_recovers_first_and_a_corrupt_block_exits_with_3() {
+    let rows = generate_rows(43, 30_000);
+    let db = loaded_database("merge-corrupt", &rows);
+    let dead = db.join("t").join("tmp_merge_all_1_1_9");
+    fs::create_dir(&dead).unwrap();
+    fs::write(dead.join("owner.lock"), b"").unwrap();
+
+    let first = active_parts(&db)[0].split('\t').next().unwrap().to_string();
+    let bin = db.join("t").join(&first).join("c0.bin");
+    let mut bytes = fs::read(&bin).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    fs::write(&bin, bytes).unwrap();
+
+    let done = veta(&["merge", "--db", text(&db), "--table", "t", "--final"]);
+    assert_eq!(done.status.code(), Some(3), "{done:?}");
+    let stderr = String::from_utf8(done.stderr).unwrap();
+    assert!(
+        stderr.starts_with(&format!("veta: corrupt part {first}: ")),
+        "{stderr}"
+    );
+    assert!(leftover_dirs(&db).is_empty());
+    assert!(
+        db.join("t/detached")
+            .join(format!("broken_{first}"))
+            .is_dir()
+    );
+    fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn the_background_merger_merges_every_table_until_it_is_killed() {
+    let rows = generate_rows(44, 30_000);
+    let db = loaded_database("merger", &rows);
+    let all = "SELECT * FROM t";
+    let before = sorted(sql(&db, "2", all));
+    let done = veta(&[
+        "sql",
+        "--db",
+        text(&db),
+        "CREATE TABLE u (k BIGINT NOT NULL, PRIMARY KEY (k))",
+    ]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    let dir = db.parent().unwrap().to_path_buf();
+    for (i, keys) in ["1\n2\n", "3\n4\n", "0\n5\n"].iter().enumerate() {
+        let path = dir.join(format!("u{i}.tsv"));
+        fs::write(&path, keys).unwrap();
+        let done = veta(&[
+            "load",
+            "--db",
+            text(&db),
+            "--table",
+            "u",
+            "--tsv",
+            text(&path),
+        ]);
+        assert_eq!(done.status.code(), Some(0), "{done:?}");
+    }
+    let parts_of = |table: &str| {
+        let done = veta(&["parts", "--db", text(&db), "--table", table]);
+        assert_eq!(done.status.code(), Some(0), "{done:?}");
+        String::from_utf8(done.stdout).unwrap().lines().count()
+    };
+    assert!(parts_of("t") > 1 && parts_of("u") == 3);
+    // What a dead merge left: the merger recovers before starting.
+    let dead = db.join("t").join("tmp_merge_all_1_1_9");
+    fs::create_dir(&dead).unwrap();
+    fs::write(dead.join("owner.lock"), b"").unwrap();
+
+    let mut merger = Command::new(env!("CARGO_BIN_EXE_veta"))
+        .args(["merger", "--db", text(&db), "--interval-ms", "10"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the binary runs");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while (parts_of("t") > 1 || parts_of("u") > 1) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A merger only ends when it is killed.
+    assert_eq!(merger.try_wait().unwrap(), None);
+    merger.kill().unwrap();
+    merger.wait().unwrap();
+    // The kill may have caught the last cleanup.
+    let done = veta(&["recover", "--db", text(&db)]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+
+    assert_eq!((parts_of("t"), parts_of("u")), (1, 1));
+    assert!(leftover_dirs(&db).is_empty());
+    assert_eq!(sorted(sql(&db, "2", all)), before);
+    assert_eq!(
+        sql(&db, "2", "SELECT k FROM u ORDER BY k"),
+        vec!["0", "1", "2", "3", "4", "5"]
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn unsupported_subcommands_exit_with_1() {
-    for name in ["merge", "merger", "export", "parquet-meta"] {
+    for name in ["export", "parquet-meta"] {
         let done = veta(&[name, "--db", "x"]);
         assert_eq!(done.status.code(), Some(1), "{name}");
         let stderr = String::from_utf8(done.stderr).unwrap();
