@@ -10,13 +10,31 @@ Lo que el proyecto no demuestra está en [LIMITATIONS.md](LIMITATIONS.md).
 |---|---|---|
 | K0 | Fundación: contrato, investigación con fuentes fijadas, plan y comando de chequeo | Cerrada |
 | K1 | Almacenamiento, códecs, lectura Parquet, SQL de una tabla y ClickBench igual a ClickHouse y DuckDB | Cerrada |
-| K2 | Subconsultas, joins, optimizador con cardinalidad, TPC-H y oráculos TLP y encendido/apagado | Pendiente |
+| K2 | Subconsultas, joins, optimizador con cardinalidad, TPC-H y oráculos TLP y encendido/apagado | Cerrada |
 | K3 | Fusiones, recuperación tras cortes, detección de corrupción, escritura Parquet y compresión | Pendiente |
 | K4 | Rendimiento contra las referencias, memoria, multihilo y catálogo de mutantes | Pendiente |
 
 ## Resultados
 
-Medidos al cierre de K1 (2026-11-04), en la máquina del proyecto (Ryzen 5 5600G, 14 GiB visibles):
+### Cierre de K2 (2026-11-06)
+
+Los veredictos son de la verificación de cierre. Las cifras son de la corrida anterior sobre el mismo commit (`9586a99`).
+
+| Comando | Veredicto | Medido |
+|---|---|---|
+| `tpch-verify --sf 1` | PASS | 22/22 iguales a `tpch_answers()` |
+| `tpch-verify --sf 10` | PASS | 22/22 iguales a DuckDB 2.0.0 |
+| `tlp` | PASS | 1000 consultas, 0 discrepancias, 0 errores |
+| `optimizer-oracle` | PASS | 1065 consultas (1000 aleatorias + 65 de los bancos), 0 discrepancias, 0 errores |
+| `join-reorder` | PASS | factor `T(syntactic) / T(cost)` = 1.961 sobre TPC-H SF1 (umbral ≥ 1.5), resultados iguales en las 22 |
+| `cardinality` | PASS | error q: mediana 1.088 (≤ 2), p90 4.832 (≤ 10), máximo de la suite de NULL 2.005 (≤ 3); conteos iguales a DuckDB |
+| `make check` | PASS | 549 tests de Rust y 211 del arnés, 0 fallos |
+
+En ese mismo cierre siguen pasando los 9 criterios de K1, incluidas las comparaciones de ClickBench contra DuckDB y ClickHouse.
+
+### Cierre de K1 (2026-11-04)
+
+Medidos en la máquina del proyecto (Ryzen 5 5600G, 14 GiB visibles):
 
 | Comando | Resultado |
 |---|---|
@@ -29,7 +47,7 @@ Medidos al cierre de K1 (2026-11-04), en la máquina del proyecto (Ryzen 5 5600G
 | `size` | PASS: el arnés tiene menos líneas que el motor |
 | `make check` | 472 tests de Rust y 106 del arnés, 0 fallos |
 
-Todavía no hay resultados de tiempo, memoria ni multihilo de veta (K4). La línea base de las referencias está en `vault/RESEARCH.md` §5.
+Aparte del factor de `join-reorder`, que compara a veta consigo mismo, todavía no hay resultados de tiempo, memoria ni multihilo de veta (K4). La línea base de las referencias está en `vault/RESEARCH.md` §5.
 
 ## Uso
 
