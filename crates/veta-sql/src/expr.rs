@@ -338,6 +338,83 @@ impl BoundExpr {
         }
     }
 
+    /// [`Self::into_conjuncts`], and from each `OR` conjunct the conjuncts that every one
+    /// of its branches has are taken out: `(a AND b) OR (a AND c)` gives `a` and `b OR c`,
+    /// and `a OR (a AND b)` gives `a`. Both are identities of three-valued logic, so the
+    /// result is equivalent; they let an equality written in every branch become a join
+    /// key (TPC-H Q19).
+    pub fn into_factored_conjuncts(self) -> Vec<BoundExpr> {
+        let mut out = Vec::new();
+        for conjunct in self.into_conjuncts() {
+            if !matches!(
+                conjunct.kind,
+                BoundExprKind::Binary {
+                    op: BinaryOp::Or,
+                    ..
+                }
+            ) {
+                out.push(conjunct);
+                continue;
+            }
+            let mut branches: Vec<Vec<BoundExpr>> = conjunct
+                .clone()
+                .into_disjuncts()
+                .into_iter()
+                .map(BoundExpr::into_conjuncts)
+                .collect();
+            let mut common = Vec::new();
+            for c in &branches[0] {
+                if !common.contains(c) && branches[1..].iter().all(|b| b.contains(c)) {
+                    common.push(c.clone());
+                }
+            }
+            if common.is_empty() {
+                out.push(conjunct);
+                continue;
+            }
+            for b in &mut branches {
+                b.retain(|c| !common.contains(c));
+            }
+            out.extend(common);
+            if branches.iter().all(|b| !b.is_empty()) {
+                let rest = branches
+                    .into_iter()
+                    .map(|b| BoundExpr::and_all(b).expect("non-empty branch"))
+                    .reduce(|left, right| {
+                        let nullable = left.nullable || right.nullable;
+                        BoundExpr::new(
+                            BoundExprKind::Binary {
+                                op: BinaryOp::Or,
+                                left: Box::new(left),
+                                right: Box::new(right),
+                            },
+                            DataType::Boolean,
+                            nullable,
+                        )
+                    })
+                    .expect("an OR has branches");
+                out.push(rest);
+            }
+        }
+        out
+    }
+
+    /// Splits nested `OR`s into their branches.
+    pub fn into_disjuncts(self) -> Vec<BoundExpr> {
+        match self.kind {
+            BoundExprKind::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
+                let mut out = left.into_disjuncts();
+                out.extend(right.into_disjuncts());
+                out
+            }
+            kind => vec![BoundExpr { kind, ..self }],
+        }
+    }
+
     /// `c1 AND c2 AND …`, left-deep; `None` for an empty list.
     pub fn and_all(conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
         conjuncts.into_iter().reduce(|left, right| {
@@ -865,6 +942,45 @@ mod tests {
         let parts = both.into_conjuncts();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[1].columns(), vec![12]);
+    }
+
+    #[test]
+    fn factors_conjuncts_common_to_every_or_branch() {
+        let key = bin(
+            BinaryOp::Eq,
+            col(0, "a", DataType::Int64),
+            col(3, "b", DataType::Int64),
+            DataType::Boolean,
+        );
+        let gt = |c: usize, v: i64| {
+            bin(
+                BinaryOp::Gt,
+                col(c, "c", DataType::Int64),
+                BoundExpr::literal(Value::Int64(v)),
+                DataType::Boolean,
+            )
+        };
+        let or = |l: BoundExpr, r: BoundExpr| bin(BinaryOp::Or, l, r, DataType::Boolean);
+        let and = |l: BoundExpr, r: BoundExpr| BoundExpr::and_all(vec![l, r]).unwrap();
+
+        // (key AND c > 1) OR (key AND c > 2) OR (c > 3 AND key) → key, (c > 1 OR c > 2 OR c > 3).
+        let e = or(
+            or(and(key.clone(), gt(2, 1)), and(key.clone(), gt(2, 2))),
+            and(gt(2, 3), key.clone()),
+        );
+        let parts = e.into_factored_conjuncts();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], key);
+        assert_eq!(parts[1], or(or(gt(2, 1), gt(2, 2)), gt(2, 3)));
+
+        // Absorption: key OR (key AND c > 1) → key.
+        let e = or(key.clone(), and(key.clone(), gt(2, 1)));
+        assert_eq!(e.into_factored_conjuncts(), vec![key.clone()]);
+
+        // Nothing in common: the OR stays whole, next to the other conjuncts.
+        let e = and(gt(2, 0), or(and(key.clone(), gt(2, 1)), gt(2, 2)));
+        let parts = e.clone().into_factored_conjuncts();
+        assert_eq!(parts, e.into_conjuncts());
     }
 
     #[test]

@@ -176,6 +176,62 @@ fn filters_use_the_sample_selectivity_of_their_table() {
 }
 
 #[test]
+fn an_or_mixing_relations_is_estimated_branch_by_branch() {
+    let t_schema = int_schema(&["a", "b"], false);
+    let u_schema = int_schema(&["c", "d"], false);
+    let rows: Vec<Vec<Value>> = (0..1000)
+        .map(|i| vec![Value::Int64(i), Value::Int64(i % 40)])
+        .collect();
+    let mut catalog = TestCatalog::default();
+    catalog.add(
+        "t",
+        t_schema.clone(),
+        vec![0],
+        stats_of(&t_schema, &rows, &[0]),
+    );
+    catalog.add(
+        "u",
+        u_schema.clone(),
+        vec![0],
+        stats_of(&u_schema, &rows, &[0]),
+    );
+    // Over the table schemas, as the catalog sees them.
+    catalog.set_selectivity("t", &binary(BinaryOp::Lt, col(1, "b"), int(10)), 0.25);
+    catalog.set_selectivity("t", &binary(BinaryOp::Gt, col(1, "b"), int(30)), 0.2);
+    catalog.set_selectivity("u", &binary(BinaryOp::Lt, col(1, "d"), int(5)), 0.1);
+    catalog.set_selectivity("u", &binary(BinaryOp::Gt, col(1, "d"), int(8)), 0.3);
+
+    // t × u has columns t.a, t.b, u.c, u.d.
+    let cross = LogicalPlan::join(
+        LogicalPlan::scan("t", "t", t_schema),
+        LogicalPlan::scan("u", "u", u_schema),
+        JoinKind::Cross,
+        Vec::new(),
+        None,
+    );
+    let branch = |b: BoundExpr, d: BoundExpr| BoundExpr::and_all(vec![b, d]).unwrap();
+    let or = binary(
+        BinaryOp::Or,
+        branch(
+            binary(BinaryOp::Lt, col(1, "t.b"), int(10)),
+            binary(BinaryOp::Lt, col(3, "u.d"), int(5)),
+        ),
+        branch(
+            binary(BinaryOp::Gt, col(1, "t.b"), int(30)),
+            binary(BinaryOp::Gt, col(3, "u.d"), int(8)),
+        ),
+    );
+    let filtered = LogicalPlan::filter(cross, or);
+    let (s1, s2) = (0.25 * 0.1, 0.2 * 0.3);
+    let expected = 1e6 * (1.0 - (1.0 - s1) * (1.0 - s2));
+    let estimate = estimate(&filtered, &catalog);
+    assert!(
+        (estimate - expected).abs() < 1e-6,
+        "{estimate} vs {expected}"
+    );
+}
+
+#[test]
 fn parquet_rows_come_from_the_metadata_with_default_selectivity() {
     let schema = int_schema(&["x", "y"], true);
     let mut catalog = TestCatalog::default();

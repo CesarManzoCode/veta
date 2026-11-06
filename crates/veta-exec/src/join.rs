@@ -245,16 +245,15 @@ fn build_partition(
     let table = match layout {
         KeyLayout::Fixed64(_) => {
             let mut table = FixedTable::<u64>::with_slots(2 * n);
-            let keys_of = |d: &KeyData| match d {
-                KeyData::U64(k) => Some(k.as_slice()),
-                _ => None,
-            };
             insert_fixed(
                 &mut table,
                 pieces,
                 lists,
                 p,
-                keys_of,
+                |d| match d {
+                    KeyData::U64(k) => Some(k.as_slice()),
+                    _ => None,
+                },
                 &mut ids,
                 &mut members,
             )?;
@@ -262,16 +261,15 @@ fn build_partition(
         }
         KeyLayout::Fixed128(_) => {
             let mut table = FixedTable::<u128>::with_slots(2 * n);
-            let keys_of = |d: &KeyData| match d {
-                KeyData::U128(k) => Some(k.as_slice()),
-                _ => None,
-            };
             insert_fixed(
                 &mut table,
                 pieces,
                 lists,
                 p,
-                keys_of,
+                |d| match d {
+                    KeyData::U128(k) => Some(k.as_slice()),
+                    _ => None,
+                },
                 &mut ids,
                 &mut members,
             )?;

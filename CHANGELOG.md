@@ -12,6 +12,8 @@ Implementado y sin medir: ningún comando de este K se ha corrido todavía; los 
 - Reordenación de joins internos por costo (DPccp, voraz por encima de 12 relaciones), `--join-order` y `EXPLAIN ANALYZE`.
 - Arnés: `load tpch`, `tpch-verify`, `join-reorder` y `cardinality`.
 - Arnés: `gen.py` genera tablas y consultas aleatorias con semilla fija (§17). `tlp` compara cada consulta con la unión de sus particiones `p`, `NOT p` y `p IS NULL`; `optimizer-oracle` compara con y sin `--no-optimizer` esas consultas, las 43 de ClickBench y las 22 de TPC-H. Un error del motor en cualquier ejecución cuenta como discrepancia.
+- Decisión: al partir `WHERE` y `ON` en conjunciones, el binder saca de cada `OR` las conjunciones que repiten todas sus ramas (`(a AND b) OR (a AND c)` → `a`, `b OR c`; es una identidad de la lógica de tres valores). Así la igualdad de TPC-H Q19, escrita en cada rama, se vuelve clave de join al construir el plan (§11.1) también con `--no-optimizer`; sin esto Q19 era un join de bucle anidado de 6 M × 200 K filas en SF1, que no terminaba.
+- Decisión: el estimador ya no da 0.1 a un `OR` que mezcla relaciones; estima cada rama como un filtro (muestra de cada tabla) y combina las ramas como independientes, `1 − Π (1 − s_i)`. Con 0.1, el join de Q19 en SF1 se estimaba en 22 352 filas contra 121 reales (error q 185).
 - Decisión: el generador cambia de base cada 250 consultas (cada una con sus 3 tablas), para que el número de filas y las fracciones de NULL también varíen dentro de una corrida. Con menos consultas que el umbral de §16, `tlp` y `optimizer-oracle` terminan en FAIL.
 
 ### K1 — almacenamiento, códecs, lectura Parquet y ClickBench correcto (2026-11-04)

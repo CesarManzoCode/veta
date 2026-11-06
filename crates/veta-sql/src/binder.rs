@@ -6,7 +6,9 @@
 //!
 //! Joins: every comma entry and every `INNER`/`CROSS JOIN` of a `FROM` is one relation of a
 //! join group; a `LEFT JOIN` is a single relation of its enclosing group. The `ON`
-//! predicates of inner joins and the `WHERE` conjuncts form the group's predicate pool.
+//! predicates of inner joins and the `WHERE` conjuncts form the group's predicate pool;
+//! the conjuncts common to every branch of an `OR` are taken out of it first
+//! ([`BoundExpr::into_factored_conjuncts`]).
 //! Relations are joined in the connected syntactic order of §11.3 and each equality
 //! between the relations already joined and the next one becomes a join key (§11.1); the
 //! other predicates stay in a `Filter` above the join tree. When that order differs from
@@ -1632,7 +1634,7 @@ impl Binder<'_> {
         let mut pool = Vec::new();
         for on in ons {
             let p = require_type(bind_expr(on, &scope, None)?, DataType::Boolean, "ON")?;
-            pool.extend(p.into_conjuncts());
+            pool.extend(p.into_factored_conjuncts());
         }
         // A subquery's WHERE also sees the FROM of the query above, after its own.
         let correlated_scope = self.outer.as_ref().map(|outer| Scope {
@@ -1649,7 +1651,7 @@ impl Binder<'_> {
         for w in where_ {
             let target = correlated_scope.as_ref().unwrap_or(&scope);
             let p = require_type(bind_expr(w, target, None)?, DataType::Boolean, "WHERE")?;
-            for c in p.into_conjuncts() {
+            for c in p.into_factored_conjuncts() {
                 if c.columns().iter().any(|&i| i >= scope.len()) {
                     correlated.push(c);
                 } else {
@@ -1836,7 +1838,7 @@ impl Binder<'_> {
                 }
                 let condition =
                     require_type(bind_expr(on, &scope, None)?, DataType::Boolean, "ON")?;
-                let (keys, rest) = split_keys(condition.into_conjuncts(), l.scope.len());
+                let (keys, rest) = split_keys(condition.into_factored_conjuncts(), l.scope.len());
                 let plan = LogicalPlan::join(
                     l.plan,
                     r.plan,

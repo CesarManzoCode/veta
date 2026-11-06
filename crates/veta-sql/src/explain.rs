@@ -511,8 +511,15 @@ mod tests {
         );
         assert_eq!(json.get("actual_rows"), Some(&Json::Number(7.0)));
         let predicates = strings(json.items("predicates"));
+        // The cost-based reorder picks the sides, so the join key may come either way round.
+        assert!(
+            predicates
+                .iter()
+                .any(|p| p == "(o.o_orderkey = l.l_orderkey)"
+                    || p == "(l.l_orderkey = o.o_orderkey)"),
+            "join key not in {predicates:?}"
+        );
         for expected in [
-            "(o.o_orderkey = l.l_orderkey)",
             "(o.o_orderdate < CAST('1995-03-15' AS DATE))",
             "(o.o_stamp >= CAST('1995-03-15 01:02:03' AS TIMESTAMP))",
             "(o.o_comment = 'it''s \"quoted\"')",

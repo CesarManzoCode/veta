@@ -624,6 +624,35 @@ fn q13_left_join_keeps_its_on_predicate_and_column_aliases() {
 }
 
 #[test]
+fn q19_equality_in_every_or_branch_becomes_the_join_key() {
+    let sql = "SELECT sum(l_extendedprice) FROM lineitem, part \
+         WHERE (p_partkey = l_partkey AND p_brand = 'Brand#12' AND l_quantity <= 11 \
+         AND l_shipinstruct = 'DELIVER IN PERSON') \
+         OR (p_partkey = l_partkey AND p_brand = 'Brand#23' AND l_quantity <= 20 \
+         AND l_shipinstruct = 'DELIVER IN PERSON')";
+    let p = plan(sql);
+    let LogicalPlan::Join { kind, keys, .. } = join_of(&p, JoinKind::Inner) else {
+        unreachable!()
+    };
+    assert_eq!(*kind, JoinKind::Inner);
+    assert_eq!(key_text(keys), vec!["lineitem.l_partkey = part.p_partkey"]);
+    // The other common conjunct and the rest of the OR stay in the filter above.
+    let Some(LogicalPlan::Filter { predicate, .. }) = find(&p, &|n| n.op() == "Filter") else {
+        panic!("no filter in\n{}", p.display_tree())
+    };
+    let parts: Vec<String> = predicate
+        .clone()
+        .into_conjuncts()
+        .iter()
+        .map(BoundExpr::to_sql)
+        .collect();
+    assert_eq!(parts.len(), 2, "{parts:?}");
+    assert_eq!(parts[0], "(lineitem.l_shipinstruct = 'DELIVER IN PERSON')");
+    assert!(parts[1].contains(" OR "), "{parts:?}");
+    assert!(!parts[1].contains("p_partkey"), "{parts:?}");
+}
+
+#[test]
 fn uncorrelated_exists_and_select_list_scalars() {
     let p = plan("SELECT o_orderkey FROM orders WHERE NOT EXISTS (SELECT * FROM region)");
     let LogicalPlan::Join { keys, .. } = join_of(&p, JoinKind::Anti) else {

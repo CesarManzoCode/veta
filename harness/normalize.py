@@ -9,6 +9,7 @@ import csv
 import io
 import math
 import re
+import sys
 
 from harness.engines import split_rows
 
@@ -81,6 +82,8 @@ def parse_tsv(text: str) -> list[tuple]:
 
 def parse_csv(text: str) -> list[tuple]:
     """DuckDB `-csv -noheader` output as normalized rows (quoted cells may hold `\\n`)."""
+    # A cell has no size bound: a `tpch_answers()` answer holds a whole result.
+    csv.field_size_limit(sys.maxsize)
     reader = csv.reader(io.StringIO(text, newline=""), strict=False)
     return [tuple(normalize_csv_cell(c) for c in row) for row in reader]
 

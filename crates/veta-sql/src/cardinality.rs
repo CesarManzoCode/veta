@@ -24,7 +24,9 @@
 //!
 //! - An unknown NDV of a join key counts as the row count of its side (each value once).
 //! - A table without statistics counts [`DEFAULT_ROWS`] rows; an unknown predicate shape
-//!   (mixing relations, or without a sample) counts [`DEFAULT_SELECTIVITY`] per conjunct;
+//!   (mixing relations, or without a sample) counts [`DEFAULT_SELECTIVITY`] per conjunct,
+//!   except an `OR` mixing relations: each branch is estimated as a filter on its own and
+//!   the branches combine as independent, `1 − Π (1 − s_i)`;
 //!   `a = b` between two relations counts like a join key.
 //! - Semi joins keep the fraction `min(1, NDV_R / NDV_L) · (1 − nf_L)` of the left rows
 //!   (containment); anti joins keep the rest; a null-aware anti join also drops left rows
@@ -425,6 +427,8 @@ impl<'a> Estimator<'a> {
                 }
             } else if let Some(s) = column_equality(&conjunct, &rel) {
                 sel *= s;
+            } else if let Some(s) = self.disjunction(&rel, &conjunct) {
+                sel *= s;
             } else {
                 sel *= DEFAULT_SELECTIVITY;
             }
@@ -456,6 +460,31 @@ impl<'a> Estimator<'a> {
             }
         }
         rel
+    }
+
+    /// Selectivity on `rel` of an `OR` that mixes relations: each branch is estimated as a
+    /// filter of `rel` and the branches combine as independent, `1 − Π (1 − s_i)`.
+    fn disjunction(&self, rel: &Rel, conjunct: &BoundExpr) -> Option<f64> {
+        if !matches!(
+            conjunct.kind,
+            BoundExprKind::Binary {
+                op: BinaryOp::Or,
+                ..
+            }
+        ) || rel.rows <= 0.0
+        {
+            return None;
+        }
+        let none: f64 = conjunct
+            .clone()
+            .into_disjuncts()
+            .into_iter()
+            .map(|branch| {
+                let kept = self.filter(rel.clone(), branch.into_conjuncts()).rows / rel.rows;
+                1.0 - kept.clamp(0.0, 1.0)
+            })
+            .product();
+        Some(1.0 - none)
     }
 
     /// NDV of the composite key `columns` of `side` from the HLL of a primary-key prefix:
@@ -579,8 +608,10 @@ impl<'a> Estimator<'a> {
 
     /// `left ++ right` columns over `rows` rows.
     fn concat(&self, left: Rel, right: Rel, rows: f64) -> Rel {
-        let left = left.reduced(rows.min(left.rows));
-        let right = right.reduced(rows.min(right.rows));
+        let left_rows = rows.min(left.rows);
+        let right_rows = rows.min(right.rows);
+        let left = left.reduced(left_rows);
+        let right = right.reduced(right_rows);
         let mut columns = left.columns;
         columns.extend(right.columns);
         for c in &mut columns {
