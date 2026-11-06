@@ -12,11 +12,12 @@ use veta_codec::{Compressor, Encoding, bench_compressor, decode, encode_with, sn
 use veta_core::error::{Result, VetaError};
 use veta_core::rand::Rng;
 use veta_core::{DataType, Value, Vector, VectorData};
-use veta_exec::{Database, ExecOptions};
+use veta_exec::{Database, ExecOptions, keep_worker_error};
 use veta_storage::block::{block_bytes, read_block_exact};
-use veta_storage::{PartReader, Snapshot};
+use veta_storage::{PartReader, Snapshot, Table};
 
 use crate::args::Parsed;
+use crate::table_tools::read_or_detach;
 
 /// Codec names of the cases of one column, in a fixed order, with their outcome.
 type Outcomes = Vec<(&'static str, bool)>;
@@ -177,13 +178,13 @@ fn fold_outcomes(total: &mut Outcomes, block: Outcomes) {
 }
 
 /// The cases of one stored column over every block of the snapshot.
-fn check_column(parts: &[PartReader], column: usize) -> Result<Outcomes> {
+fn check_column(table: &Table, parts: &[PartReader], column: usize) -> Result<Outcomes> {
     let mut total = Vec::new();
     for part in parts {
         for granule in 0..part.granules() {
             fold_outcomes(
                 &mut total,
-                check_vector(&part.read_granule(column, granule)?),
+                check_vector(&read_or_detach(table, part, column, granule)?),
             );
         }
     }
@@ -191,7 +192,7 @@ fn check_column(parts: &[PartReader], column: usize) -> Result<Outcomes> {
 }
 
 /// Checks every column on the worker threads; the results come back in column order.
-fn check_table(parts: &[PartReader], columns: usize) -> Result<Vec<Outcomes>> {
+fn check_table(table: &Table, parts: &[PartReader], columns: usize) -> Result<Vec<Outcomes>> {
     let next = AtomicUsize::new(0);
     let next = &next;
     let workers = ExecOptions::default_threads().min(columns).max(1);
@@ -205,7 +206,7 @@ fn check_table(parts: &[PartReader], columns: usize) -> Result<Vec<Outcomes>> {
                         if column >= columns {
                             return Ok(done);
                         }
-                        done.push((column, check_column(parts, column)?));
+                        done.push((column, check_column(table, parts, column)?));
                     }
                 })
             })
@@ -220,8 +221,15 @@ fn check_table(parts: &[PartReader], columns: usize) -> Result<Vec<Outcomes>> {
             .collect()
     });
     let mut all = Vec::with_capacity(columns);
+    let mut failure = None;
     for done in joined {
-        all.extend(done?);
+        match done {
+            Ok(done) => all.extend(done),
+            Err(err) => keep_worker_error(&mut failure, err),
+        }
+    }
+    if let Some(err) = failure {
+        return Err(err);
     }
     all.sort_by_key(|entry| entry.0);
     Ok(all.into_iter().map(|entry| entry.1).collect())
@@ -273,7 +281,7 @@ pub(crate) fn cmd_codec_roundtrip(args: &[String]) -> Result<()> {
             eprintln!("{}", detached.message());
         }
         let fields = &table.schema().fields;
-        let outcomes = check_table(snapshot.parts(), fields.len())?;
+        let outcomes = check_table(&table, snapshot.parts(), fields.len())?;
         for (field, column) in fields.iter().zip(&outcomes) {
             report(&mut out, &field.name, column, &mut counts)?;
         }

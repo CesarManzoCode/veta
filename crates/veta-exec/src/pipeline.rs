@@ -18,7 +18,7 @@ use veta_core::{Chunk, DataType, Result, Vector, VectorData, VetaError};
 use veta_parquet::ParquetFile;
 use veta_sql::{BoundExpr, BoundExprKind};
 use veta_storage::prune::prune_part;
-use veta_storage::{PartReader, Snapshot, Table, detach_part};
+use veta_storage::{PartReader, Snapshot, Table, detach_corrupt};
 
 use crate::context::{ExecContext, add, new_reservation};
 use crate::expr_eval::CompiledExpr;
@@ -62,6 +62,19 @@ impl Dispatcher {
 
 /// Runs `work` on `workers` threads (inline if only one) and returns every state, or the
 /// first error in worker order. A panic in a worker becomes an internal error.
+/// Keeps in `kept` the error a run ends with when several workers fail. A corrupt part wins:
+/// it was detached already, so the exit code has to say 3 (§6.4). Any other corrupt part gets
+/// its line on stderr here, since only one error reaches the end of the process.
+pub fn keep_worker_error(kept: &mut Option<VetaError>, err: VetaError) {
+    let corrupt = matches!(err, VetaError::Corrupt { .. });
+    match kept {
+        Some(VetaError::Corrupt { .. }) if corrupt => eprintln!("veta: {err}"),
+        Some(VetaError::Corrupt { .. }) => {}
+        Some(_) if !corrupt => {}
+        _ => *kept = Some(err),
+    }
+}
+
 fn join_workers<S: Send>(workers: usize, work: impl Fn() -> Result<S> + Sync) -> Result<Vec<S>> {
     if workers <= 1 {
         return Ok(vec![work()?]);
@@ -74,12 +87,11 @@ fn join_workers<S: Send>(workers: usize, work: impl Fn() -> Result<S> + Sync) ->
         for handle in handles {
             match handle.join() {
                 Ok(Ok(state)) => states.push(state),
-                Ok(Err(err)) => {
-                    first_error.get_or_insert(err);
-                }
-                Err(_) => {
-                    first_error.get_or_insert(VetaError::internal("worker thread panicked"));
-                }
+                Ok(Err(err)) => keep_worker_error(&mut first_error, err),
+                Err(_) => keep_worker_error(
+                    &mut first_error,
+                    VetaError::internal("worker thread panicked"),
+                ),
             }
         }
         match first_error {
@@ -495,8 +507,8 @@ impl Pipeline {
                         Err(err) => {
                             // §6.4: the part is detached before the process exits. The
                             // query fails with `err` whatever the detaching does.
-                            if matches!(err, VetaError::Corrupt { .. }) {
-                                let _ = detach_part(source.table.dir(), part.name());
+                            if let Err(failure) = detach_corrupt(source.table.dir(), &err) {
+                                eprintln!("veta: {failure}");
                             }
                             return Err(err);
                         }
@@ -650,6 +662,7 @@ pub(crate) fn slice_chunks(chunks: Vec<Chunk>, offset: u64, limit: Option<u64>) 
 mod tests {
     use super::*;
     use crate::context::ExecStats;
+
     use crate::database::Database;
     use std::collections::HashSet;
     use veta_core::Value;
@@ -795,5 +808,20 @@ mod tests {
             first_column(&out.chunks),
             vec![Value::Int64(3), Value::Int64(4)]
         );
+    }
+
+    #[test]
+    fn a_corrupt_part_decides_how_a_run_ends() {
+        let corrupt = |part: &str| VetaError::corrupt(part, "crc");
+        let mut kept = None;
+        keep_worker_error(&mut kept, VetaError::user("overflow"));
+        keep_worker_error(&mut kept, VetaError::Io("disk".into()));
+        assert_eq!(kept, Some(VetaError::user("overflow")));
+        keep_worker_error(&mut kept, corrupt("all_1_1_0"));
+        assert_eq!(kept, Some(corrupt("all_1_1_0")));
+        keep_worker_error(&mut kept, VetaError::user("overflow"));
+        keep_worker_error(&mut kept, corrupt("all_2_2_0"));
+        assert_eq!(kept, Some(corrupt("all_1_1_0")));
+        assert_eq!(kept.map(|err| err.exit_code()), Some(3));
     }
 }

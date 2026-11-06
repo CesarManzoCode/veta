@@ -2,16 +2,16 @@
 //! `sample.bin` of every active part combined into one [`TableStats`].
 //!
 //! Rows and NULLs are summed, min/max widened, column and key-prefix HLLs merged register
-//! by register and the part samples concatenated in block order. Reading statistics never
-//! detaches anything: a part that fails its checks is left out here and is detached (and
-//! reported) by the [`Snapshot`](crate::Snapshot) the query takes to read its rows.
+//! by register and the part samples concatenated in block order. The parts are opened by a
+//! [`Snapshot`], so a part that fails its checks is detached here as on any other opening
+//! (§6.4); whoever wants to report it takes the snapshot and calls [`merge_part_stats`].
 
+use veta_core::Result;
 use veta_core::stats::TableStats;
-use veta_core::{Result, VetaError};
 
-use crate::locks::lock_shared;
-use crate::part::{PartReader, active_parts, list_parts};
-use crate::table::{READERS_LOCK, Table};
+use crate::part::PartReader;
+use crate::snapshot::Snapshot;
+use crate::table::Table;
 
 /// Statistics of one opened part as a [`TableStats`].
 pub fn part_table_stats(part: &PartReader) -> TableStats {
@@ -34,23 +34,10 @@ pub fn merge_part_stats(table: &Table, parts: &[PartReader]) -> Result<TableStat
 }
 
 /// Statistics of the active parts of `table` at one instant (§11.5). Opens each part
-/// without keeping any `c<N>.bin`; a part that vanished or is corrupt is skipped.
+/// without keeping any `c<N>.bin`; a broken one is detached and left out.
 pub fn table_stats(table: &Table) -> Result<TableStats> {
-    let parts = {
-        let _readers = lock_shared(&table.lock_path(READERS_LOCK))?;
-        let mut parts = Vec::new();
-        for name in active_parts(&list_parts(table.dir())?) {
-            let dir = table.dir().join(name.to_string());
-            match PartReader::open_columns(&dir, table.schema(), table.primary_key(), &[]) {
-                Ok(part) => parts.push(part),
-                Err(VetaError::Corrupt { .. }) => {}
-                Err(_) if !dir.is_dir() => {}
-                Err(err) => return Err(err),
-            }
-        }
-        parts
-    };
-    merge_part_stats(table, &parts)
+    let snapshot = Snapshot::take(table, Some(&[]))?;
+    merge_part_stats(table, snapshot.parts())
 }
 
 #[cfg(test)]
@@ -153,7 +140,8 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let stats = table_stats(&table).unwrap();
         assert_eq!(stats.rows, 100);
-        // Statistics never detach: the broken part is still in place.
-        assert!(table.dir().join("all_2_2_0").is_dir());
+        // §6.4: opening a part to read its statistics detaches it like any other opening.
+        assert!(!table.dir().join("all_2_2_0").exists());
+        assert!(table.dir().join("detached/broken_all_2_2_0").is_dir());
     }
 }

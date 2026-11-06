@@ -781,45 +781,268 @@ fn invalid_sql_exits_with_1() {
     }
 }
 
+/// Changes the byte in the middle of `file` of a part of table `t`.
+fn flip_byte(db: &Path, part: &str, file: &str) {
+    let path = db.join("t").join(part).join(file);
+    let mut bytes = fs::read(&path).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x55;
+    fs::write(&path, bytes).unwrap();
+}
+
+fn assert_detached(db: &Path, part: &str) {
+    assert!(!db.join("t").join(part).exists(), "{part} is still active");
+    assert!(
+        db.join("t")
+            .join("detached")
+            .join(format!("broken_{part}"))
+            .is_dir(),
+        "{part} is not in detached/"
+    );
+}
+
+/// The one stderr line of a corrupt block: `veta: corrupt part <part>: <reason>`.
+fn assert_corrupt_line(done: &Output, part: &str) {
+    assert_eq!(done.status.code(), Some(3), "{done:?}");
+    let stderr = String::from_utf8_lossy(&done.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    let reason = stderr.strip_prefix(&format!("veta: corrupt part {part}: "));
+    assert!(reason.is_some_and(|r| r.len() > 1), "{stderr}");
+}
+
 #[test]
 fn corrupt_block_exits_with_3() {
     let rows = generate_rows(17, 12_000);
     let db = loaded_database("corrupt", &rows);
     let db_text = text(&db);
-    let part = db.join("t").join("all_2_2_0");
-    let bin = part.join("c0.bin");
-    let mut bytes = fs::read(&bin).unwrap();
-    let middle = bytes.len() / 2;
-    bytes[middle] ^= 0x55;
-    fs::write(&bin, bytes).unwrap();
-
-    let check = veta(&["check", "--db", db_text, "--table", "t"]);
-    assert_eq!(check.status.code(), Some(3), "{check:?}");
-    let stderr = String::from_utf8(check.stderr).unwrap();
-    assert!(
-        stderr.contains("veta: corrupt part all_2_2_0: "),
-        "{stderr}"
-    );
-    assert!(part.is_dir(), "check does not separate parts yet");
+    flip_byte(&db, "all_2_2_0", "c0.bin");
 
     let done = veta(&["sql", "--db", db_text, "SELECT sum(id) FROM t"]);
-    assert_eq!(done.status.code(), Some(3), "{done:?}");
+    assert_corrupt_line(&done, "all_2_2_0");
     assert!(done.stdout.is_empty());
-    let stderr = String::from_utf8(done.stderr).unwrap();
-    assert!(
-        stderr.contains("veta: corrupt part all_2_2_0: "),
-        "{stderr}"
-    );
-    assert!(!part.exists());
-    assert!(
-        db.join("t")
-            .join("detached")
-            .join("broken_all_2_2_0")
-            .is_dir()
-    );
+    assert_detached(&db, "all_2_2_0");
 
     let check = veta(&["check", "--db", db_text, "--table", "t"]);
     assert_eq!(check.status.code(), Some(0), "{check:?}");
+}
+
+#[test]
+fn a_changed_byte_in_each_file_type_ends_with_the_part_out() {
+    let rows = generate_rows(61, 12_000);
+    let query = "SELECT sum(id), count(*) FROM t";
+    // The second batch is the part that breaks.
+    let kept: Vec<&Row> = rows[..4000].iter().chain(&rows[8000..]).collect();
+    let without = format!(
+        "{}\t{}",
+        kept.iter().map(|r| r.id as i128).sum::<i128>(),
+        kept.len()
+    );
+    for file in [
+        "part.txt",
+        "primary.idx",
+        "c0.bin",
+        "c0.mrk",
+        "stats.bin",
+        "sample.bin",
+        "checksums.txt",
+    ] {
+        let db = loaded_database(&format!("corrupt-{}", file.replace('.', "-")), &rows);
+        flip_byte(&db, "all_2_2_0", file);
+
+        let done = veta(&["sql", "--db", text(&db), "--threads", "4", query]);
+        let stderr = String::from_utf8_lossy(&done.stderr).into_owned();
+        if file == "c0.bin" {
+            assert_corrupt_line(&done, "all_2_2_0");
+            assert!(done.stdout.is_empty(), "{done:?}");
+        } else {
+            assert_eq!(done.status.code(), Some(0), "{file}: {done:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&done.stdout).trim_end(),
+                without,
+                "{file}"
+            );
+            assert!(
+                stderr.starts_with("veta: detached broken part all_2_2_0: "),
+                "{file}: {stderr}"
+            );
+        }
+        assert_detached(&db, "all_2_2_0");
+
+        assert_eq!(sql(&db, "4", query), vec![without.clone()], "{file}");
+        let check = veta(&["check", "--db", text(&db), "--table", "t"]);
+        assert_eq!(check.status.code(), Some(0), "{file}: {check:?}");
+        fs::remove_dir_all(db.parent().unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn check_detaches_every_corrupt_part_and_exits_with_3() {
+    let rows = generate_rows(67, 12_000);
+    let db = loaded_database("check-detaches", &rows);
+    let db_text = text(&db);
+    flip_byte(&db, "all_1_1_0", "stats.bin");
+    flip_byte(&db, "all_3_3_0", "c2.bin");
+
+    let check = veta(&["check", "--db", db_text, "--table", "t"]);
+    assert_eq!(check.status.code(), Some(3), "{check:?}");
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("veta: detached broken part all_1_1_0: "),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("veta: corrupt part all_3_3_0: "),
+        "{stderr}"
+    );
+    assert_detached(&db, "all_1_1_0");
+    assert_detached(&db, "all_3_3_0");
+    let report = String::from_utf8_lossy(&check.stdout);
+    assert!(report.starts_with("check: 3 parts, "), "{report}");
+    assert!(report.trim_end().ends_with(", 2 corrupt"), "{report}");
+    assert_eq!(active_parts(&db).len(), 1);
+
+    let again = veta(&["check", "--db", db_text, "--table", "t"]);
+    assert_eq!(again.status.code(), Some(0), "{again:?}");
+    assert!(again.stderr.is_empty(), "{again:?}");
+    fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn every_tool_that_reads_blocks_exits_with_3_and_detaches() {
+    let rows = generate_rows(71, 12_000);
+    let db = loaded_database("tools-corrupt", &rows);
+    let db_text = text(&db);
+    let out = db.parent().unwrap().join("dump");
+
+    flip_byte(&db, "all_1_1_0", "c1.bin");
+    let dump = veta(&[
+        "dump-columns",
+        "--db",
+        db_text,
+        "--table",
+        "t",
+        "--out",
+        text(&out),
+    ]);
+    assert_corrupt_line(&dump, "all_1_1_0");
+    assert_detached(&db, "all_1_1_0");
+
+    flip_byte(&db, "all_2_2_0", "c3.bin");
+    let roundtrip = veta(&["codec-roundtrip", "--db", db_text, "--table", "t"]);
+    assert_corrupt_line(&roundtrip, "all_2_2_0");
+    assert_detached(&db, "all_2_2_0");
+
+    // The rest reads well, and a part broken on opening is reported and left out.
+    let roundtrip = veta(&["codec-roundtrip", "--db", db_text, "--table", "t"]);
+    assert_eq!(roundtrip.status.code(), Some(0), "{roundtrip:?}");
+    flip_byte(&db, "all_3_3_0", "c0.mrk");
+    let dump = veta(&[
+        "dump-columns",
+        "--db",
+        db_text,
+        "--table",
+        "t",
+        "--out",
+        text(&out),
+    ]);
+    assert_eq!(dump.status.code(), Some(0), "{dump:?}");
+    let stderr = String::from_utf8_lossy(&dump.stderr);
+    assert!(
+        stderr.starts_with("veta: detached broken part all_3_3_0: "),
+        "{stderr}"
+    );
+    assert_detached(&db, "all_3_3_0");
+    fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn explain_detaches_a_part_broken_on_opening() {
+    let rows = generate_rows(73, 12_000);
+    let db = loaded_database("explain-corrupt", &rows);
+    flip_byte(&db, "all_2_2_0", "sample.bin");
+    let done = veta(&["sql", "--db", text(&db), "EXPLAIN SELECT id FROM t"]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    let stderr = String::from_utf8_lossy(&done.stderr);
+    assert!(
+        stderr.starts_with("veta: detached broken part all_2_2_0: "),
+        "{stderr}"
+    );
+    assert_detached(&db, "all_2_2_0");
+    fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+/// What a `kill -9` may leave, all at once: a half-written insert with a dead owner, a merge
+/// written and not renamed, and a half-deleted part. The merge sources stay in place, so the
+/// active set is the one from before and the rows do not change.
+fn leave_crash_state(db: &Path) {
+    let dead = db.join("t").join("tmp_insert_90");
+    fs::create_dir(&dead).unwrap();
+    fs::write(dead.join("owner.lock"), b"").unwrap();
+    fs::write(dead.join("c0.bin"), b"partial").unwrap();
+    let merge = db.join("t").join("tmp_merge_all_1_2_1");
+    fs::create_dir(&merge).unwrap();
+    fs::write(merge.join("owner.lock"), b"").unwrap();
+    let doomed = db.join("t").join("delete_tmp_all_80_80_0");
+    fs::create_dir(&doomed).unwrap();
+    fs::write(doomed.join("c0.bin"), b"partial").unwrap();
+}
+
+#[test]
+fn recover_and_load_clean_what_a_crash_left() {
+    let rows = generate_rows(79, 12_000);
+    let db = loaded_database("recover-states", &rows);
+    let db_text = text(&db);
+    let query = "SELECT sum(id), count(*) FROM t";
+    let before = sql(&db, "2", query);
+    let parts = active_parts(&db);
+
+    leave_crash_state(&db);
+    assert_eq!(leftover_dirs(&db).len(), 3);
+    // Readers never delete.
+    assert_eq!(sql(&db, "2", query), before);
+    assert_eq!(leftover_dirs(&db).len(), 3);
+
+    let done = veta(&["recover", "--db", db_text, "--table", "t"]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    assert!(leftover_dirs(&db).is_empty());
+    assert_eq!(active_parts(&db), parts);
+    assert_eq!(sql(&db, "2", query), before);
+
+    // A part broken on opening is separated by recover, which still ends with 0.
+    flip_byte(&db, "all_3_3_0", "part.txt");
+    let done = veta(&["recover", "--db", db_text]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    let stderr = String::from_utf8_lossy(&done.stderr);
+    assert!(
+        stderr.starts_with("veta: detached broken part all_3_3_0: "),
+        "{stderr}"
+    );
+    assert_detached(&db, "all_3_3_0");
+
+    // `load` starts by recovering.
+    leave_crash_state(&db);
+    let batch = db.parent().unwrap().join("batch0.tsv");
+    let done = veta(&[
+        "load",
+        "--db",
+        db_text,
+        "--table",
+        "t",
+        "--tsv",
+        text(&batch),
+    ]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    assert!(leftover_dirs(&db).is_empty());
+
+    // So does `merge`.
+    let check = veta(&["check", "--db", db_text, "--table", "t"]);
+    assert_eq!(check.status.code(), Some(0), "{check:?}");
+    leave_crash_state(&db);
+    let done = veta(&["merge", "--db", db_text, "--table", "t", "--final"]);
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    assert!(leftover_dirs(&db).is_empty());
+    assert_eq!(active_parts(&db).len(), 1);
+    fs::remove_dir_all(db.parent().unwrap()).unwrap();
 }
 
 #[test]

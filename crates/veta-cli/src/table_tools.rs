@@ -8,10 +8,9 @@ use std::path::Path;
 use veta_core::error::{Result, VetaError};
 use veta_core::{Vector, VectorData};
 use veta_exec::Database;
-use veta_storage::locks::lock_shared;
-use veta_storage::part::{active_parts, list_parts};
-use veta_storage::table::READERS_LOCK;
-use veta_storage::{PartReader, Snapshot, recover};
+use veta_storage::{
+    DetachedPart, PartReader, Snapshot, Table, check_table, detach_corrupt, recover,
+};
 
 use crate::args::Parsed;
 
@@ -41,54 +40,42 @@ pub(crate) fn cmd_recover(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Reads every block of `part`.
-fn check_blocks(part: &PartReader, columns: usize) -> Result<u64> {
-    let mut blocks = 0;
-    for column in 0..columns {
-        for granule in 0..part.granules() {
-            part.read_granule(column, granule)?;
-            blocks += 1;
+/// Reads a block for a command that goes through the rows of a table. A corrupt one detaches
+/// its part before the command fails with exit 3 (§6.4), as in a query.
+pub(crate) fn read_or_detach(
+    table: &Table,
+    part: &PartReader,
+    column: usize,
+    granule: usize,
+) -> Result<Vector> {
+    part.read_granule(column, granule).inspect_err(|err| {
+        if let Err(failure) = detach_corrupt(table.dir(), err) {
+            eprintln!("veta: {failure}");
         }
-    }
-    Ok(blocks)
+    })
 }
 
-/// `check --db D --table T`: verifies every block of every active part and exits with 3 if
-/// any part is corrupt. Corrupt parts are reported but stay in place for now; separating
-/// them (§6.4) arrives with K3.
+/// `check --db D --table T`: verifies every block of every part, detaches the corrupt ones
+/// and exits with 3 if there was any (§6.4).
 pub(crate) fn cmd_check(args: &[String]) -> Result<()> {
     let parsed = Parsed::new(args, &["--db", "--table"], &[], &[])?;
     parsed.no_positional()?;
     let db = Database::open(parsed.required("--db")?);
     let table = db.open_table(parsed.required("--table")?)?;
-    let mut corrupt = Vec::new();
-    let mut parts = Vec::new();
-    {
-        let _readers = lock_shared(&table.lock_path(READERS_LOCK))?;
-        for name in active_parts(&list_parts(table.dir())?) {
-            let dir = table.dir().join(name.to_string());
-            match PartReader::open(&dir, table.schema(), table.primary_key()) {
-                Ok(part) => parts.push(part),
-                Err(err @ VetaError::Corrupt { .. }) => corrupt.push(err),
-                Err(err) => return Err(err),
-            }
-        }
+    let report = check_table(&table)?;
+    for part in &report.broken {
+        eprintln!("{}", part.message());
     }
-    let mut blocks = 0;
-    for part in &parts {
-        match check_blocks(part, table.schema().len()) {
-            Ok(n) => blocks += n,
-            Err(err @ VetaError::Corrupt { .. }) => corrupt.push(err),
-            Err(err) => return Err(err),
-        }
-    }
+    let mut corrupt: Vec<VetaError> = report
+        .broken
+        .iter()
+        .chain(&report.corrupt)
+        .map(DetachedPart::error)
+        .collect();
     println!(
-        "check: {} parts, {blocks} blocks, {} corrupt",
-        parts.len()
-            + corrupt
-                .iter()
-                .filter(|e| is_open_failure(e, &parts))
-                .count(),
+        "check: {} parts, {} blocks, {} corrupt",
+        report.parts,
+        report.blocks,
         corrupt.len()
     );
     match corrupt.pop() {
@@ -99,14 +86,6 @@ pub(crate) fn cmd_check(args: &[String]) -> Result<()> {
             Err(last)
         }
         None => Ok(()),
-    }
-}
-
-/// Whether `err` names a part that could not even be opened.
-fn is_open_failure(err: &VetaError, opened: &[PartReader]) -> bool {
-    match err {
-        VetaError::Corrupt { part, .. } => !opened.iter().any(|p| p.name().to_string() == *part),
-        _ => false,
     }
 }
 
@@ -240,7 +219,8 @@ pub(crate) fn cmd_dump_columns(args: &[String]) -> Result<()> {
         let mut bits = BitWriter::default();
         for part in snapshot.parts() {
             for granule in 0..part.granules() {
-                write_raw(&mut out, &mut bits, &part.read_granule(column, granule)?)?;
+                let block = read_or_detach(&table, part, column, granule)?;
+                write_raw(&mut out, &mut bits, &block)?;
             }
         }
         bits.finish(&mut out)?;

@@ -5,14 +5,15 @@
 //! part is opened and verified, keeping the `c<N>.bin` of the requested columns open; then
 //! the lock is released. The open descriptors keep the data alive even if a merge cleanup
 //! deletes the directories afterwards. If a part vanished while opening (`ENOENT`), the
-//! snapshot starts over. A part that fails its integrity checks is moved to
+//! snapshot starts over. The parts that fail their integrity checks are moved to
 //! `detached/broken_<name>` and left out (§6.4); the snapshot then starts over too, since
-//! the active set may have changed. Readers never delete anything.
+//! the active set may have changed: what a broken part covered is active again. Readers
+//! never delete anything.
 
 use veta_core::{Result, VetaError};
 
 use crate::locks::lock_shared;
-use crate::part::{PartName, PartReader, active_parts, list_parts};
+use crate::part::{PartReader, active_parts, list_parts};
 use crate::recover::{DetachedPart, detach_part};
 use crate::table::{READERS_LOCK, Table};
 
@@ -29,23 +30,28 @@ pub struct Snapshot {
 enum Attempt {
     Done(Vec<PartReader>),
     Vanished,
-    Broken(PartName, String),
+    Broken(Vec<DetachedPart>),
 }
 
 fn attempt(table: &Table, columns: &[usize]) -> Result<Attempt> {
     let _readers = lock_shared(&table.lock_path(READERS_LOCK))?;
     let active = active_parts(&list_parts(table.dir())?);
     let mut parts = Vec::with_capacity(active.len());
+    let mut broken = Vec::new();
     for name in active {
         let dir = table.dir().join(name.to_string());
         match PartReader::open_columns(&dir, table.schema(), table.primary_key(), columns) {
             Ok(part) => parts.push(part),
             Err(_) if !dir.is_dir() => return Ok(Attempt::Vanished),
-            Err(VetaError::Corrupt { reason, .. }) => return Ok(Attempt::Broken(name, reason)),
+            Err(VetaError::Corrupt { reason, .. }) => broken.push(DetachedPart { name, reason }),
             Err(err) => return Err(err),
         }
     }
-    Ok(Attempt::Done(parts))
+    if broken.is_empty() {
+        Ok(Attempt::Done(parts))
+    } else {
+        Ok(Attempt::Broken(broken))
+    }
 }
 
 impl Snapshot {
@@ -65,9 +71,11 @@ impl Snapshot {
             match attempt(table, columns)? {
                 Attempt::Done(parts) => return Ok(Snapshot { parts, detached }),
                 Attempt::Vanished => {}
-                Attempt::Broken(name, reason) => {
-                    detach_part(table.dir(), name)?;
-                    detached.push(DetachedPart { name, reason });
+                Attempt::Broken(broken) => {
+                    for part in broken {
+                        detach_part(table.dir(), part.name)?;
+                        detached.push(part);
+                    }
                 }
             }
         }
@@ -103,6 +111,7 @@ mod tests {
     use super::*;
     use crate::fsutil::testdir::TestDir;
     use crate::insert::insert;
+    use crate::part::PartName;
     use crate::part::tests::write_part;
     use crate::sort::sort_chunk;
     use crate::table::DETACHED_DIR;
@@ -199,5 +208,48 @@ mod tests {
                 .is_dir()
         );
         assert_eq!(snapshot.rows(), 50);
+    }
+
+    fn break_part(table: &Table, part: PartName) {
+        let stats = table.dir().join(part.to_string()).join("stats.bin");
+        let mut bytes = fs::read(&stats).unwrap();
+        bytes[10] ^= 0xff;
+        fs::write(&stats, bytes).unwrap();
+    }
+
+    #[test]
+    fn every_broken_part_goes_in_one_pass_and_what_it_covered_comes_back() {
+        let db = TestDir::new("snapshot-broken-many");
+        let table = Table::create(db.path(), sample_def("t")).unwrap();
+        for n in 1..=4 {
+            insert(&table, &batch(&table, n, 50)).unwrap();
+        }
+        let mut merged = batch(&table, 1, 50);
+        merged.extend(&batch(&table, 2, 50)).unwrap();
+        let merged = sort_chunk(&merged, table.primary_key())
+            .unwrap()
+            .unwrap_or(merged);
+        let covering = PartName::new(1, 2, 1);
+        write_part(
+            table.dir(),
+            covering,
+            table.schema(),
+            table.primary_key(),
+            &merged,
+            merged.len,
+        );
+        break_part(&table, covering);
+        break_part(&table, PartName::new(3, 3, 0));
+        break_part(&table, PartName::new(1, 1, 0));
+
+        let snapshot = Snapshot::take(&table, None).unwrap();
+        let names: Vec<PartName> = snapshot.parts().iter().map(PartReader::name).collect();
+        assert_eq!(names, vec![PartName::new(2, 2, 0), PartName::new(4, 4, 0)]);
+        let mut detached: Vec<PartName> = snapshot.detached().iter().map(|d| d.name).collect();
+        detached.sort();
+        assert_eq!(
+            detached,
+            vec![PartName::new(1, 1, 0), covering, PartName::new(3, 3, 0)]
+        );
     }
 }

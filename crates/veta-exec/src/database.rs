@@ -17,8 +17,9 @@ use veta_parquet::ParquetFile;
 use veta_sql::ast::CreateTable;
 use veta_sql::{BoundExpr, Catalog, CatalogTable, Statement, parse_statement};
 use veta_storage::part::{PartName, active_parts, list_parts};
+use veta_storage::stats::merge_part_stats;
 use veta_storage::table::{TABLE_SQL, table_exists};
-use veta_storage::{Table, TableDef, table_stats};
+use veta_storage::{PartReader, Snapshot, Table, TableDef};
 
 use crate::expr_eval::eval_predicate;
 
@@ -82,7 +83,8 @@ impl Database {
     }
 
     /// Merged statistics of the active parts of `table` (§11.5); `None` if they cannot be
-    /// read.
+    /// read. A part that is opened here for the first time and fails its checks is detached
+    /// and reported on stderr (§6.4), and the query never counts it.
     pub fn table_stats(&self, table: &Table) -> Option<Arc<TableStats>> {
         let parts = active_parts(&list_parts(table.dir()).ok()?);
         let key = table.name().to_ascii_lowercase();
@@ -92,7 +94,12 @@ impl Database {
         {
             return Some(stats.clone());
         }
-        let stats = Arc::new(table_stats(table).ok()?);
+        let snapshot = Snapshot::take(table, Some(&[])).ok()?;
+        for detached in snapshot.detached() {
+            eprintln!("{}", detached.message());
+        }
+        let stats = Arc::new(merge_part_stats(table, snapshot.parts()).ok()?);
+        let parts = snapshot.parts().iter().map(PartReader::name).collect();
         cache.insert(key, (parts, stats.clone()));
         Some(stats)
     }

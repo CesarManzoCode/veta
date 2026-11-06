@@ -17,7 +17,8 @@
 //! §6.1 releases `.insert.lock` before step 2. Here it is released after it, so a block
 //! number is never assigned without its `tmp_insert_<b>` being visible: a merge choosing
 //! its window under that lock ([`crate::merge`]) must not span a block still being
-//! written, or the part published later would be covered, and so lost, at birth.
+//! written, or the part published later would be covered, and so lost, at birth. Recovery
+//! relies on the same lock ([`create_owned_tmp`]).
 
 use std::fs;
 use std::io;
@@ -96,20 +97,29 @@ fn next_block_number(table: &Table) -> Result<u64> {
     Ok(block)
 }
 
+/// Creates the part directory under construction `tmp` and takes its `owner.lock` before
+/// anything is written in it. The caller holds `.insert.lock`, shared or exclusive: recovery
+/// looks at the `tmp_*` under the exclusive lock, so it never finds a live one between the
+/// `mkdir` and the `flock`, where `try_lock` would succeed and pass its owner for dead.
+pub(crate) fn create_owned_tmp(tmp: &Path) -> Result<FileLock> {
+    fs::create_dir(tmp).map_err(|e| io_err(tmp, e))?;
+    match lock_exclusive(&tmp.join(OWNER_LOCK)) {
+        Ok(owner) => Ok(owner),
+        Err(err) => {
+            let _ = remove_dir_all_if_exists(tmp);
+            Err(err)
+        }
+    }
+}
+
 /// Steps 1 and 2 of §6.1: the block number, its temporary directory and its held
 /// `owner.lock`, all under `.insert.lock`.
 fn begin_insert(table: &Table) -> Result<(u64, PathBuf, FileLock)> {
     let _lock = lock_exclusive(&table.lock_path(INSERT_LOCK))?;
     let block = next_block_number(table)?;
     let tmp = table.dir().join(format!("{TMP_INSERT_PREFIX}{block}"));
-    fs::create_dir(&tmp).map_err(|e| io_err(&tmp, e))?;
-    match lock_exclusive(&tmp.join(OWNER_LOCK)) {
-        Ok(owner) => Ok((block, tmp, owner)),
-        Err(err) => {
-            let _ = remove_dir_all_if_exists(&tmp);
-            Err(err)
-        }
-    }
+    let owner = create_owned_tmp(&tmp)?;
+    Ok((block, tmp, owner))
 }
 
 /// Inserts `chunk` as one new part; returns its name, or `None` for an empty batch.

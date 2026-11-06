@@ -6,7 +6,7 @@
 //! - [`block`]: blocks of §5.3; [`part`]: parts of §5.2 ([`PartWriter`], [`PartReader`]).
 //! - [`table`]: table directories; [`locks`]: `flock` helpers.
 //! - [`insert`]: atomic insertion of §6.1; [`snapshot`]: reader snapshot of §6.3;
-//!   [`recover`]: recovery of §6.5 and detaching of broken parts (§6.4).
+//!   [`recover`]: recovery of §6.5, `veta check` and detaching of broken parts (§6.4).
 //! - [`merge`]: window selection and vertical merge of §7 with the protocol of §6.2.
 //! - [`prune`]: part and granule selection by the sparse primary index (§11.4).
 //! - [`sort`]: ordering of a batch by the primary key with typed comparators.
@@ -29,7 +29,9 @@ pub mod table;
 pub use insert::insert;
 pub use merge::{MergeOptions, MergeStep, MergeSummary, MergedPart, Merger};
 pub use part::{GRANULE_ROWS, PartMeta, PartName, PartReader, PartStats, PartWriter};
-pub use recover::{DetachedPart, RecoveryReport, detach_part, recover};
+pub use recover::{
+    CheckReport, DetachedPart, RecoveryReport, check_table, detach_corrupt, detach_part, recover,
+};
 pub use snapshot::Snapshot;
 pub use stats::table_stats;
 pub use table::{Table, TableDef};

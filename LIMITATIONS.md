@@ -44,6 +44,9 @@ Fuente única de lo que veta no demuestra. Ningún otro archivo repite estos lí
 - Al cierre de K2, `tlp` y `optimizer-oracle` corrieron justo el umbral (1000 y 1065 consultas) y con la semilla por omisión: no hay medición con otras semillas ni con más consultas.
 - Las consultas aleatorias no generan subconsultas, `HAVING`, `AVG`, `COUNT(DISTINCT)`, `Float64` ni `Timestamp`, y solo dos tablas pueden unirse por cadenas o sin clave de igualdad. TLP tampoco ejercita `TopN` en las particiones: quita `ORDER BY` y `LIMIT` y ordena en el arnés.
 - `kill -9` deja la caché de páginas intacta: los cortes no prueban pérdida de energía, aunque el protocolo hace `fsync`.
+- Un byte cambiado en un `c<N>.bin` solo se detecta al leer ese bloque: una consulta que no lee esa columna, o cuya poda salta ese gránulo, responde sin enterarse. Solo `veta check` recorre todos los bloques.
+- Una parte separada a `detached/` no vuelve sola y no hay comando para reincorporarla: sus filas salen de la tabla. Si es una parte fusionada cuyas fuentes ya se borraron, no queda otra copia de esas filas.
+- `dump-columns` que termina con 3 deja en `--out` los `.raw` que alcanzó a escribir, con las filas de los bloques que sí verificaron.
 - DELTA_BYTE_ARRAY no la escribe ningún oráculo: su lectura se prueba con dos archivos de `apache/parquet-testing` y su escritura con lo que leen DuckDB y ClickHouse.
 - El catálogo de mutantes tiene seis fallas plantadas; que todas mueran no prueba que el arnés detecte cualquier falla.
 - `make check` solo vuelve fatales los avisos `clippy::correctness` y `clippy::suspicious`; al cierre de K2 quedan 19 avisos de estilo y complejidad sin corregir.

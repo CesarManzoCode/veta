@@ -1071,6 +1071,19 @@ impl PartReader {
         )
     }
 
+    /// Reads and verifies every block of every column (`veta check`, §6.4); how many there
+    /// were. Every column must have been opened ([`PartReader::open`]).
+    pub fn verify_blocks(&self) -> Result<u64> {
+        let mut blocks = 0;
+        for column in 0..self.schema.len() {
+            for granule in 0..self.granules {
+                self.read_granule(column, granule)?;
+                blocks += 1;
+            }
+        }
+        Ok(blocks)
+    }
+
     /// Every granule of `column`, concatenated.
     pub fn read_column(&self, column: usize) -> Result<Vector> {
         let data_type = self
@@ -1423,11 +1436,8 @@ pub(crate) mod tests {
 
     fn open_and_read_all(path: &Path, schema: &Schema, key: &[usize]) -> Result<()> {
         let part = PartReader::open(path, schema, key)?;
-        for c in 0..schema.len() {
-            for g in 0..part.granules() {
-                part.read_granule(c, g)?;
-            }
-        }
+        let blocks = part.verify_blocks()?;
+        assert_eq!(blocks, (schema.len() * part.granules()) as u64);
         Ok(())
     }
 

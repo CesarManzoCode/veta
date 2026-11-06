@@ -21,7 +21,9 @@
 //! an exclusive `.readers.lock`, every part it covers is renamed to `delete_tmp_<name>` and
 //! deleted. Readers are only stopped for that last step and the sources stay readable through
 //! their open descriptors. A `tmp_merge_*` left behind by a dead merge is removed as soon as
-//! the same window is merged again, since `.merge.lock` proves its owner gone.
+//! the same window is merged again, since `.merge.lock` proves its owner gone. The directory
+//! and its `owner.lock` are made under a shared `.insert.lock`, which is what lets recovery
+//! trust its `try_lock` ([`crate::insert::create_owned_tmp`]).
 //!
 //! **Blocks in flight.** Beyond §6.2: a window must not span the block of an insert that is
 //! still running, because the part published later would be covered, and so lost, at birth.
@@ -31,7 +33,6 @@
 //! gone for good (dead insert, detached part), and only the second one stops a window.
 
 use std::collections::HashMap;
-use std::fs;
 use std::ops::Range;
 use std::path::Path;
 use std::thread;
@@ -39,8 +40,8 @@ use std::time::Duration;
 
 use veta_core::{Result, Vector, VectorData, VetaError};
 
-use crate::fsutil::{io_err, remove_dir_all_if_exists, subdirectories, sync_dir};
-use crate::insert::publish_part;
+use crate::fsutil::{remove_dir_all_if_exists, subdirectories, sync_dir};
+use crate::insert::{create_owned_tmp, publish_part};
 use crate::locks::{FileLock, lock_exclusive, lock_shared, try_lock_exclusive};
 use crate::part::{
     GRANULE_ROWS, OWNER_LOCK, PartName, PartReader, PartWriter, active_parts, list_parts,
@@ -560,14 +561,10 @@ impl Merger {
 
         let dir = self.table.dir();
         let tmp = dir.join(format!("{TMP_MERGE_PREFIX}{name}"));
-        remove_abandoned_tmp(&tmp)?;
-        fs::create_dir(&tmp).map_err(|e| io_err(&tmp, e))?;
-        let owner = match lock_exclusive(&tmp.join(OWNER_LOCK)) {
-            Ok(lock) => lock,
-            Err(err) => {
-                let _ = remove_dir_all_if_exists(&tmp);
-                return Err(err);
-            }
+        let owner = {
+            let _creating = lock_shared(&self.table.lock_path(INSERT_LOCK))?;
+            remove_abandoned_tmp(&tmp)?;
+            create_owned_tmp(&tmp)?
         };
         let written = write_and_publish(&self.table, sources, name, &tmp);
         if let Err(err) = &written {
@@ -649,6 +646,7 @@ mod tests {
     use crate::sort::sort_chunk;
     use crate::table::tests::sample_def;
     use crate::table::{DETACHED_DIR, TableDef};
+    use std::fs;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, Ordering};
     use veta_core::rand::Rng;
