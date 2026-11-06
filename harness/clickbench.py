@@ -1,9 +1,11 @@
-"""ClickBench: `load clickbench` (§14.3), `clickbench-verify` (§15), `pruning` and
-`codec-roundtrip` over `hits` (§17)."""
+"""ClickBench: `load clickbench` (§14.3), `clickbench-verify` (§15), and `pruning`,
+`codec-roundtrip`, `disk-bytes` and `compressor` over `hits` (§16, §17)."""
 
 import argparse
+import json
 import re
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -390,3 +392,198 @@ def codec_roundtrip(args, p: Paths, report: Report):
     if bad:
         summary += f"; failed: {', '.join(bad)}"
     return (PASS if not bad else FAIL), summary
+
+
+# disk-bytes
+
+DISK_BYTES_MAX_FACTOR = 1.10
+
+
+def parse_du(stdout: bytes) -> int | None:
+    """Bytes of `du -sb <path>`: the first field of its line."""
+    fields = stdout.split()
+    return int(fields[0]) if fields and fields[0].isdigit() else None
+
+
+def clickhouse_bytes_sql(database: str) -> str:
+    return (f"SELECT sum(bytes_on_disk) FROM system.parts WHERE database = {sql_string(database)} "
+            f"AND table = {sql_string(TABLE)} AND active")
+
+
+def disk_factor(veta_bytes: int | None, clickhouse_bytes: int | None) -> float | None:
+    if veta_bytes is None or not clickhouse_bytes:
+        return None
+    return veta_bytes / clickhouse_bytes
+
+
+def disk_bytes_verdict(parts: int | None, factor: float | None) -> str:
+    """One active part after `merge --final` and `du -sb` ≤ 1.10 × ClickHouse's bytes (§16)."""
+    return PASS if parts == 1 and factor is not None and factor <= DISK_BYTES_MAX_FACTOR else FAIL
+
+
+def disk_bytes(args, p: Paths, report: Report):
+    """`veta merge --final` on the ClickBench database, then `du -sb` of `hits` against
+    `sum(bytes_on_disk)` of ClickHouse."""
+    engines = Engines(p)
+    dbs = clickbench_databases(p)
+    require_loaded(engines, dbs, "veta", "clickhouse")
+    report.progress("merge --final")
+    merge = engines.veta("merge", "--db", dbs.veta, "--table", TABLE, "--final")
+    report.raw("veta", "merge", merge.stdout)
+    if not merge.ok:
+        raise Infra(f"merge --final exited {merge.code}: {merge.error_tail()}")
+    listing = engines.veta("parts", "--db", dbs.veta, "--table", TABLE)
+    report.raw("veta", "parts", listing.stdout)
+    parts = len([row for row in listing.rows if row]) if listing.ok else None
+    table_dir = dbs.veta / TABLE
+    du = subprocess.run(["du", "-sb", str(table_dir)], capture_output=True)
+    veta_bytes = parse_du(du.stdout) if du.returncode == 0 else None
+    if veta_bytes is None:
+        raise Infra(f"du -sb {table_dir} exited {du.returncode}: {du.stderr.decode(errors='replace').strip()}")
+    run = engines.clickhouse(clickhouse_bytes_sql(dbs.clickhouse_database), dbs.clickhouse_database,
+                             dbs.clickhouse_path)
+    report.raw("clickhouse", "bytes_on_disk", run.stdout)
+    row = first_row(run)
+    clickhouse_bytes = int(row[0]) if row and len(row) == 1 and row[0].isdigit() else None
+    if clickhouse_bytes is None:
+        raise Infra(f"clickhouse sum(bytes_on_disk) exited {run.code}: {run.error_tail()}")
+    factor = disk_factor(veta_bytes, clickhouse_bytes)
+    report.fields.update(veta_bytes=veta_bytes, clickhouse_bytes=clickhouse_bytes, factor=factor, parts=parts)
+    shown = "n/a" if factor is None else f"{factor:.3f}"
+    return disk_bytes_verdict(parts, factor), (
+        f"veta {veta_bytes} bytes, clickhouse {clickhouse_bytes} bytes, factor {shown}, {parts} parts"
+    )
+
+
+# compressor
+
+COMPRESSOR_MIN_RATIO = 1.0
+COMPRESSOR_MIN_DSPEED = 0.33
+BENCH_ITERATIONS = 3
+LZ4_ARGS = ("-b1", "-i3", "-q")
+# `-1  <compressed> (<ratio>) <MB/s> MB/s <MB/s> MB/s  <file>` (RESEARCH §3); the fields may
+# also come with `->` and commas, as in lz4's verbose line.
+LZ4_RE = re.compile(r"(\d+)\s+\(\s*(\d+(?:\.\d+)?)\s*\),?\s+(\d+(?:\.\d+)?)\s*MB/s,?\s+(\d+(?:\.\d+)?)\s*MB/s")
+CODEC_BENCH_KEYS = ("file", "raw_bytes", "compressed_bytes", "compress_mb_s", "decompress_mb_s")
+
+
+def parse_lz4_bench(text: str) -> dict | None:
+    """`compressed_bytes`, `compress_mb_s` and `decompress_mb_s` of the last result line of
+    `lz4 -b1`; it rewrites its progress with `\\r`, so only the final line counts."""
+    found = None
+    for line in re.split(r"[\r\n]", text):
+        m = LZ4_RE.search(line)
+        if m:
+            found = m
+    if found is None:
+        return None
+    return {
+        "compressed_bytes": int(found.group(1)),
+        "compress_mb_s": float(found.group(3)),
+        "decompress_mb_s": float(found.group(4)),
+    }
+
+
+def parse_codec_bench(text: str) -> dict[str, dict]:
+    """`file → record` from the JSON lines of `veta codec-bench` (§13)."""
+    records = {}
+    for n, line in enumerate(text.split("\n"), 1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict) or any(k not in record for k in CODEC_BENCH_KEYS):
+            raise ValueError(f"codec-bench line {n} lacks one of {', '.join(CODEC_BENCH_KEYS)}")
+        records[record["file"]] = record
+    return records
+
+
+def aggregate_ratio(raw: list[int], compressed: list[int]) -> float | None:
+    """`Σ raw / Σ compressed` (§16)."""
+    total = sum(compressed)
+    return sum(raw) / total if raw and total > 0 else None
+
+
+def aggregate_speed(raw: list[int], speeds: list[float]) -> float | None:
+    """`Σ raw bytes / Σ (bytes_i / speed_i)` (§16): the speed of the whole set as one stream."""
+    if not raw or len(raw) != len(speeds) or any(s <= 0 for s in speeds):
+        return None
+    return sum(raw) / sum(r / s for r, s in zip(raw, speeds))
+
+
+def compressor_stats(items: list[dict]) -> dict:
+    raw = [i["raw_bytes"] for i in items]
+    return {
+        "ratio_vlz": aggregate_ratio(raw, [i["vlz_bytes"] for i in items]),
+        "ratio_lz4": aggregate_ratio(raw, [i["lz4_bytes"] for i in items]),
+        "dspeed_vlz": aggregate_speed(raw, [i["vlz_decompress_mb_s"] for i in items]),
+        "dspeed_lz4": aggregate_speed(raw, [i["lz4_decompress_mb_s"] for i in items]),
+    }
+
+
+def compressor_verdict(stats: dict) -> str:
+    """vlz ratio ≥ 1.0 × LZ4's and decompression speed ≥ 0.33 × LZ4's, both aggregated (§16)."""
+    if None in stats.values():
+        return FAIL
+    return PASS if (stats["ratio_vlz"] >= COMPRESSOR_MIN_RATIO * stats["ratio_lz4"]
+                    and stats["dspeed_vlz"] >= COMPRESSOR_MIN_DSPEED * stats["dspeed_lz4"]) else FAIL
+
+
+def compressor(args, p: Paths, report: Report):
+    """`dump-columns` of `hits`, then `lz4 -b1 -i3 -q` and `veta codec-bench --compressor vlz`
+    on each column file, against the thresholds of §16."""
+    engines = Engines(p)
+    dbs = clickbench_databases(p)
+    require_loaded(engines, dbs, "veta")
+    lz4 = shutil.which("lz4")
+    if lz4 is None:
+        raise Skip("lz4 missing from PATH")
+    scratch = p.scratch / report.name
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    columns = scratch / "columns"
+    columns.mkdir(parents=True)
+    report.progress("dump-columns")
+    dump = engines.veta("dump-columns", "--db", dbs.veta, "--table", TABLE, "--out", columns)
+    report.raw("veta", "dump-columns", dump.stdout)
+    if not dump.ok:
+        raise Infra(f"dump-columns exited {dump.code}: {dump.error_tail()}")
+    files = sorted(f for f in columns.iterdir() if f.suffix == ".raw")
+    empty = [f.name for f in files if f.stat().st_size == 0]
+    files = [f for f in files if f.stat().st_size > 0]
+    if not files:
+        raise Infra(f"dump-columns wrote no non-empty column file in {columns}")
+    report.progress(f"codec-bench on {len(files)} files")
+    bench = engines.veta("codec-bench", "--compressor", "vlz", "--iterations", BENCH_ITERATIONS, "--file", *files)
+    report.raw("veta", "codec-bench", bench.stdout)
+    if not bench.ok:
+        raise Infra(f"codec-bench exited {bench.code}: {bench.error_tail()}")
+    try:
+        vlz = parse_codec_bench(bench.text)
+    except ValueError as e:
+        raise Infra(f"codec-bench: {e}") from e
+    for file in files:
+        record = vlz.get(str(file))
+        run = subprocess.run([lz4, *LZ4_ARGS, str(file)], capture_output=True)
+        output = (run.stderr + b"\n" + run.stdout).decode("utf-8", errors="replace")
+        measured = parse_lz4_bench(output) if run.returncode == 0 else None
+        if record is None or measured is None:
+            missing = "codec-bench" if record is None else f"lz4 (exit {run.returncode}): {output.strip()[-200:]}"
+            raise Infra(f"{file.name}: no result from {missing}")
+        item = report.add({
+            "file": str(file),
+            "raw_bytes": file.stat().st_size,
+            "vlz_bytes": record["compressed_bytes"],
+            "vlz_decompress_mb_s": record["decompress_mb_s"],
+            "vlz_compress_mb_s": record["compress_mb_s"],
+            "lz4_bytes": measured["compressed_bytes"],
+            "lz4_decompress_mb_s": measured["decompress_mb_s"],
+            "lz4_compress_mb_s": measured["compress_mb_s"],
+            "vlz_raw_bytes": record["raw_bytes"],
+            "lz4_output": output.strip(),
+        })
+        report.progress(f"{file.name}: vlz {item['vlz_bytes']} B {item['vlz_decompress_mb_s']} MB/s, "
+                        f"lz4 {item['lz4_bytes']} B {item['lz4_decompress_mb_s']} MB/s")
+    stats = compressor_stats(report.items)
+    report.fields.update(stats, skipped_empty=empty)
+    summary = ", ".join(f"{name} {'n/a' if value is None else f'{value:.3f}'}" for name, value in stats.items())
+    return compressor_verdict(stats), summary

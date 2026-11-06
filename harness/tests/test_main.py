@@ -21,7 +21,9 @@ class ParserTest(unittest.TestCase):
         self.assertEqual((report_name(args), args.tamper), ("clickbench-verify-duckdb", None))
         args = parser.parse_args(["clickbench-verify", "--against", "clickhouse", "--tamper", "7"])
         self.assertEqual((report_name(args), args.tamper), ("clickbench-verify-clickhouse", "q07"))
-        for name in ("pruning", "codec-roundtrip", "size", "deps"):
+        for name in ("pruning", "codec-roundtrip", "size", "deps", "disk-bytes", "compressor",
+                     "parquet-read-duckdb", "parquet-read-hits", "parquet-write-duckdb",
+                     "parquet-write-clickhouse", "parquet-stats", "parquet-rowgroup-skip"):
             self.assertEqual(report_name(parser.parse_args([name])), name)
 
     def test_tpch_commands(self):

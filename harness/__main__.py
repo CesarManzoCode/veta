@@ -9,7 +9,7 @@ import resource
 import sys
 import traceback
 
-from harness import clickbench, durability, fetch, meta, oracles, tpch
+from harness import clickbench, durability, fetch, meta, oracles, parquet_interop, tpch
 from harness.config import paths
 from harness.report import EXIT_USAGE, FAIL, SKIP, Infra, Report, Skip
 
@@ -83,6 +83,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = commands.add_parser("corruption", help="one byte changed in each file type of a part")
     p.set_defaults(func=durability.corruption, report_name="corruption")
+
+    p = commands.add_parser("disk-bytes", help="du -sb of hits after merge --final against ClickHouse")
+    p.set_defaults(func=clickbench.disk_bytes, report_name="disk-bytes")
+
+    p = commands.add_parser("compressor", help="vlz against lz4 -b1 on the dump-columns files of hits")
+    p.set_defaults(func=clickbench.compressor, report_name="compressor")
+
+    for name, func, text in (
+        ("parquet-read-duckdb", parquet_interop.parquet_read_duckdb, "DuckDB writes Parquet, veta reads it"),
+        ("parquet-read-hits", parquet_interop.parquet_read_hits, "counts and sums of each hits_N.parquet"),
+        ("parquet-write-duckdb", parquet_interop.parquet_write_duckdb, "veta exports, DuckDB reads"),
+        ("parquet-write-clickhouse", parquet_interop.parquet_write_clickhouse, "veta exports, ClickHouse reads"),
+        ("parquet-stats", parquet_interop.parquet_stats, "footer statistics of the exported files"),
+        ("parquet-rowgroup-skip", parquet_interop.parquet_rowgroup_skip, "row groups skipped by l_shipdate"),
+    ):
+        p = commands.add_parser(name, help=text)
+        p.set_defaults(func=func, report_name=name)
 
     p = commands.add_parser("size", help="non-empty lines of the engine and of the harness")
     p.set_defaults(func=meta.size, report_name="size")

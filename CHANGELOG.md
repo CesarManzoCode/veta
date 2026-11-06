@@ -2,6 +2,20 @@
 
 ## Sin publicar
 
+### K3 — fusión, recuperación, escritura Parquet y comandos de durabilidad, Parquet y compresión (sin fecha de cierre)
+
+Nada de esta entrada está medido todavía: los comandos existen y tienen tests con datos sintéticos, pero ninguno se corrió contra el binario real en sus mini sprints. Las cifras y los veredictos llegan con la verificación de cierre del K.
+
+- Fusión vertical y política de ventanas de §7: `veta merge [--final]` y el fusionador en segundo plano `veta merger`.
+- Recuperación y detección de corrupción: `veta check` verifica cada bloque de cada parte, separa las corruptas en `detached/` y termina con 3; las lecturas, `dump-columns` y `codec-roundtrip --db` hacen lo mismo con una parte rota.
+- Escritura Parquet propia: `veta export` con `--encoding plain|dict|delta|delta-byte-array`, `--compression none|snappy`, `--page-version 1|2` y `--row-group-rows`, con estadísticas exactas por column chunk. `veta parquet-meta` imprime el pie en TSV.
+- Arnés de durabilidad: `merge-equivalence`, `concurrent-reader`, `crash-merge`, `crash-insert` y `corruption`.
+- Arnés de Parquet (`parquet_interop.py`): `parquet-read-duckdb` (archivos de DuckDB en v1/v2, con y sin diccionario, sin comprimir y Snappy, con columnas nullable y `DOUBLE`, más los dos de parquet-testing; cobertura de codificaciones por `parquet_metadata`), `parquet-read-hits`, `parquet-write-duckdb` y `parquet-write-clickhouse` (`EXCEPT ALL` en ambos sentidos contra la tabla del oráculo, con cada columna convertida al tipo de esa tabla), `parquet-stats` y `parquet-rowgroup-skip`.
+- Arnés de compresión: `disk-bytes` (`merge --final`, `du -sb` de `hits` frente a `sum(bytes_on_disk)` de ClickHouse) y `compressor` (`vlz` frente a `lz4 -b1 -i3 -q` sobre `dump-columns` de `hits`, con ratio y velocidad de descompresión agregados de §16 y los números crudos por archivo en `report.json`).
+- Decisión: `parquet-read-duckdb` lee muestras y no tablas completas, porque compara multiconjuntos en memoria: 20 000 filas de `hits` (todas sus columnas) y las filas de `lineitem` SF1 con `l_orderkey <= 40000`, escritas en grupos de 10 240 filas.
+- Decisión: `parquet-read-hits` suma las longitudes en bytes, con `length` en veta y `strlen` en DuckDB, porque el `length` de DuckDB cuenta caracteres.
+- Decisión: cada comando escribe sus propios archivos en `scratch/<nombre>/`; `parquet-write-duckdb`, `parquet-write-clickhouse` y `parquet-stats` repiten las mismas 66 exportaciones en vez de compartirlas.
+
 ### K2 — subconsultas, joins, optimizador con cardinalidad, TPC-H y oráculos (2026-11-06)
 
 - Las 22 consultas de TPC-H devuelven lo correcto: en SF1 iguales a `tpch_answers()` y en SF10 iguales a DuckDB 2.0.0. Verificado con `tpch-verify --sf 1|10`: 22/22 iguales en ambos.
