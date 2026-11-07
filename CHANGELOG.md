@@ -14,6 +14,8 @@ Nada de esta entrada está medido todavía: los comandos existen y tienen tests 
 - Arnés de compresión: `disk-bytes` (`merge --final`, `du -sb` de `hits` frente a `sum(bytes_on_disk)` de ClickHouse) y `compressor` (`vlz` frente a `lz4 -b1 -i3 -q` sobre `dump-columns` de `hits`, con ratio y velocidad de descompresión agregados de §16 y los números crudos por archivo en `report.json`).
 - Decisión: `parquet-read-duckdb` lee muestras y no tablas completas, porque compara multiconjuntos en memoria: 20 000 filas de `hits` (todas sus columnas) y las filas de `lineitem` SF1 con `l_orderkey <= 40000`, escritas en grupos de 10 240 filas.
 - Decisión: `parquet-read-hits` suma las longitudes en bytes, con `length` en veta y `strlen` en DuckDB, porque el `length` de DuckDB cuenta caracteres.
+- Descompresión de `vlz` más rápida en coincidencias de desplazamiento menor que 16: escribe byte a byte solo el primer múltiplo del desplazamiento que llega a 16 y copia el resto en bloques de 16 bytes. Antes toda la coincidencia se copiaba byte a byte.
+- Decisión: `codec-bench` descomprime en un mismo buffer de salida en todas sus corridas (`vlz::decompress_into`, `snappy::decompress_into`), como hace `lz4 -b`. Así mide el decodificador y no los fallos de página de alocar en cada corrida una salida nueva, que en `Title` de `hits` es de 1.1 GB.
 - Decisión: cada comando escribe sus propios archivos en `scratch/<nombre>/`; `parquet-write-duckdb`, `parquet-write-clickhouse` y `parquet-stats` repiten las mismas 66 exportaciones en vez de compartirlas.
 
 ### K2 — subconsultas, joins, optimizador con cardinalidad, TPC-H y oráculos (2026-11-06)

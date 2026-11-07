@@ -1329,12 +1329,16 @@ fn the_background_merger_merges_every_table_until_it_is_killed() {
 }
 
 #[test]
-fn unsupported_subcommands_exit_with_1() {
-    for name in ["export", "parquet-meta"] {
-        let done = veta(&[name, "--db", "x"]);
-        assert_eq!(done.status.code(), Some(1), "{name}");
+fn export_and_parquet_meta_with_bad_arguments_exit_with_1() {
+    for (args, message) in [
+        (&["export", "--db", "x"][..], "missing --sql"),
+        (&["parquet-meta", "--db", "x"][..], "unknown option: --db"),
+        (&["parquet-meta"][..], "missing --file"),
+    ] {
+        let done = veta(args);
+        assert_eq!(done.status.code(), Some(1), "{args:?}");
         let stderr = String::from_utf8(done.stderr).unwrap();
-        assert_eq!(stderr, format!("veta: unsupported: {name}\n"));
+        assert_eq!(stderr, format!("veta: {message}\n"), "{args:?}");
     }
 }
 

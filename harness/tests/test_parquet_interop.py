@@ -176,7 +176,8 @@ class ExceptAllTest(unittest.TestCase):
                          "SELECT column_name, data_type FROM information_schema.columns "
                          "WHERE table_name = 'hits' ORDER BY ordinal_position")
         self.assertIn("database = 'tpch_sf1' AND table = 'orders'", pi.clickhouse_columns_sql("tpch_sf1", "orders"))
-        duck = pi.parse_columns(run("duckdb", b"a,DECIMAL(15,2)\nb,VARCHAR\n"), "x")
+        # DuckDB's -csv quotes a type that contains a comma.
+        duck = pi.parse_columns(run("duckdb", b'a,"DECIMAL(15,2)"\nb,VARCHAR\n'), "x")
         self.assertEqual(duck, [("a", "DECIMAL(15,2)"), ("b", "VARCHAR")])
         house = pi.parse_columns(run("clickhouse", b"a\tNullable(Int64)\t\t\t\t\t\nb\tString\t\t\t\t\t\n"), "x")
         self.assertEqual(house, [("a", "Nullable(Int64)"), ("b", "String")])

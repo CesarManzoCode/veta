@@ -2,7 +2,8 @@
 //!
 //! One thread, best of at least `iterations` (minimum 3) runs per direction, and at least
 //! [`MIN_TIME`] of measurement in total, half compressing and half decompressing. Speeds
-//! are in MB/s of raw (uncompressed) bytes, with 1 MB = 10⁶ bytes.
+//! are in MB/s of raw (uncompressed) bytes, with 1 MB = 10⁶ bytes. Decompression runs
+//! reuse one output buffer.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -51,6 +52,14 @@ impl Compressor {
         match self {
             Compressor::Vlz => vlz::decompress(data),
             Compressor::Snappy => snappy::decompress(data),
+        }
+    }
+
+    /// [`Compressor::decompress`] into `out`, reusing its allocation.
+    pub fn decompress_into(self, data: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Compressor::Vlz => vlz::decompress_into(data, out),
+            Compressor::Snappy => snappy::decompress_into(data, out),
         }
     }
 }
@@ -112,9 +121,15 @@ fn bench_for(
     let compress = best_of(iterations, half, || {
         black_box(compressor.compress(black_box(data)));
     });
+    // One output buffer for every run, as `lz4 -b` does: the runs time the decoder, not
+    // the page faults of a fresh allocation of the whole output.
+    let mut out = Vec::with_capacity(data.len());
     let mut failed = false;
     let decompress = best_of(iterations, half, || {
-        failed |= black_box(compressor.decompress(black_box(&compressed))).is_err();
+        failed |= compressor
+            .decompress_into(black_box(&compressed), &mut out)
+            .is_err();
+        black_box(&out);
     });
     if failed {
         return Err(VetaError::internal(format!(

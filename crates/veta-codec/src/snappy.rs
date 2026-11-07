@@ -142,6 +142,14 @@ fn get_varint(input: &[u8]) -> Result<(usize, usize)> {
 
 /// Decompresses a raw Snappy stream. Malformed input is `Err`.
 pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decompress_into(input, &mut out)?;
+    Ok(out)
+}
+
+/// [`decompress`] into `out`, replacing its contents and reusing its allocation. After an
+/// `Err`, the contents of `out` are unspecified.
+pub fn decompress_into(input: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let (total, mut ip) = get_varint(input)?;
     if total > (input.len() - ip).saturating_mul(MAX_EXPANSION) {
         return Err(malformed(format!(
@@ -149,7 +157,8 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
             input.len()
         )));
     }
-    let mut out: Vec<u8> = Vec::with_capacity(total);
+    out.clear();
+    out.reserve(total);
     while ip < input.len() {
         let tag = input[ip];
         ip += 1;
@@ -225,7 +234,7 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
             out.len()
         )));
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -243,6 +252,16 @@ mod tests {
         let mut data = vec![0u8; len];
         Rng::new(seed).fill_bytes(&mut data);
         data
+    }
+
+    #[test]
+    fn decompress_into_replaces_the_contents() {
+        let data = b"snappy-snappy-snappy-veta".repeat(40);
+        let mut out = b"stale bytes".to_vec();
+        decompress_into(&compress(&data), &mut out).unwrap();
+        assert_eq!(out, data);
+        decompress_into(&compress(b"xy"), &mut out).unwrap();
+        assert_eq!(out, b"xy");
     }
 
     #[test]

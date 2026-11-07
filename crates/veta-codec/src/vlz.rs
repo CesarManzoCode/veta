@@ -251,6 +251,15 @@ fn get_extension(input: &[u8], ip: &mut usize, limit: usize) -> Result<usize> {
 
 /// Decompresses a `vlz` payload. Malformed input is `Err` (contract §6.4).
 pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decompress_into(input, &mut out)?;
+    Ok(out)
+}
+
+/// [`decompress`] into `out`, replacing its contents and reusing its allocation. After an
+/// `Err`, `out` is empty.
+pub fn decompress_into(input: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
     if input.len() < 4 {
         return Err(malformed("missing header"));
     }
@@ -261,7 +270,7 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
             input.len()
         )));
     }
-    let mut out: Vec<u8> = Vec::with_capacity(total + SLACK);
+    out.reserve(total + SLACK);
     let dst = out.as_mut_ptr();
     let mut ip = 4;
     let mut op = 0usize;
@@ -334,17 +343,38 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
                 done += 16;
             }
         } else {
-            for k in 0..len {
+            // The match repeats the last `offset` bytes, so it also repeats at any multiple
+            // of `offset`: write the first `period` bytes (the smallest multiple ≥ 16) byte
+            // by byte, then copy whole 16-byte chunks from `period` back.
+            let period = offset * 16usize.div_ceil(offset);
+            let head = period.min(len);
+            for k in 0..head {
                 // SAFETY: `op + k < total <= capacity` and the source `op + k − offset` is
                 // below `op + k`, so it was written before (byte by byte for overlaps).
                 unsafe { *dst.add(op + k) = *dst.add(op + k - offset) };
+            }
+            let mut done = head;
+            while done < len {
+                // SAFETY: `period >= 16` and `done >= period`, so the source chunk
+                // `[op + done − period, +16)` starts at or after `op − offset` (inside
+                // the periodic run), ends at or before `op + done` (already written) and
+                // does not overlap the destination; the destination ends below
+                // `op + len + 16 <= total + 16 < capacity`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        dst.add(op + done - period),
+                        dst.add(op + done),
+                        16,
+                    )
+                };
+                done += 16;
             }
         }
         op += len;
     }
     // SAFETY: every byte in `[0, total)` was written above (`op == total`).
     unsafe { out.set_len(total) };
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -441,6 +471,36 @@ mod tests {
                 packed.len()
             );
         }
+    }
+
+    #[test]
+    fn short_overlapping_matches_of_every_length() {
+        for offset in 1..=17usize {
+            for len in MIN_MATCH..=80 {
+                let literals = random(offset, (offset * 100 + len) as u64);
+                let mut expected = literals.clone();
+                for k in 0..len {
+                    expected.push(expected[k]);
+                }
+                let mut packed = (expected.len() as u32).to_le_bytes().to_vec();
+                put_sequence(&mut packed, &literals, offset, len);
+                put_last(&mut packed, &[]);
+                assert_eq!(decompress(&packed).unwrap(), expected, "{offset} {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn decompress_into_replaces_the_contents() {
+        let data = b"abcabcabcabcabcabcabc-veta-veta-veta".repeat(50);
+        let packed = compress(&data);
+        let mut out = b"stale bytes".to_vec();
+        decompress_into(&packed, &mut out).unwrap();
+        assert_eq!(out, data);
+        decompress_into(&compress(b"xy"), &mut out).unwrap();
+        assert_eq!(out, b"xy");
+        assert!(decompress_into(&packed[..packed.len() - 1], &mut out).is_err());
+        assert!(out.is_empty());
     }
 
     #[test]
