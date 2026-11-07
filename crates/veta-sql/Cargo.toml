@@ -6,3 +6,9 @@ license.workspace = true
 
 [dependencies]
 veta-core = { path = "../veta-core" }
+
+# Mutants of contract §18: off by default, each plants one fault.
+[features]
+mutant-pushdown-outer = []
+mutant-reorder-outer = []
+mutant-estimate-ignore-null = []

@@ -547,6 +547,12 @@ impl<'a> Estimator<'a> {
         let lk: Vec<ColumnEst> = keys.iter().map(|(l, _)| project_column(l, left)).collect();
         let rk: Vec<ColumnEst> = keys.iter().map(|(_, r)| project_column(r, right)).collect();
         let null_factor: f64 = lk.iter().chain(&rk).map(|c| 1.0 - c.null_frac).product();
+        // Mutant (contract §18): the `(1 − nf)` factors are left out.
+        #[cfg(feature = "mutant-estimate-ignore-null")]
+        let null_factor = {
+            let _ = null_factor;
+            1.0
+        };
         if keys.len() == 1 {
             let l = lk[0].ndv.unwrap_or(left.rows);
             let r = rk[0].ndv.unwrap_or(right.rows);

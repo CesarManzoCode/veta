@@ -262,6 +262,19 @@ fn pushdown_never_enters_the_null_side_of_a_left_join() {
 }
 
 #[test]
+fn an_is_null_filter_on_the_null_side_of_a_left_join_stays_above_it() {
+    // Pushed into lineitem it would keep only stored NULLs instead of the unmatched orders.
+    let sql = "SELECT o_orderkey FROM orders LEFT JOIN lineitem ON o_orderkey = l_orderkey \
+               WHERE l_orderkey IS NULL";
+    let text = tree(&push_down_predicates(bind(sql)));
+    assert!(
+        text.contains("Filter (lineitem.l_orderkey IS NULL)\n    Join left"),
+        "{text}"
+    );
+    assert!(text.contains("\n      Scan lineitem AS lineitem"), "{text}");
+}
+
+#[test]
 fn pushdown_moves_right_only_on_conditions_of_a_left_join_into_the_right_side() {
     let sql = "SELECT o_orderkey, l_quantity FROM orders LEFT JOIN lineitem \
                ON o_orderkey = l_orderkey AND l_quantity > 3 AND o_custkey = 7";

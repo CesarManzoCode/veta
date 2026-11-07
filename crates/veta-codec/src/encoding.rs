@@ -324,6 +324,9 @@ fn put_for(wide: bool, v: &[i128], out: &mut Vec<u8>) -> Option<()> {
     put_min(wide, min, out);
     out.push(width);
     let offsets: Vec<u64> = v.iter().map(|&x| (x - min) as u64).collect();
+    // Mutant (contract §18): the last partial mini-block is not written.
+    #[cfg(feature = "mutant-codec-drop-last-block")]
+    let offsets = offsets[..offsets.len() / bitpack::MINI_BLOCK * bitpack::MINI_BLOCK].to_vec();
     bitpack::pack(&offsets, width, out);
     Some(())
 }

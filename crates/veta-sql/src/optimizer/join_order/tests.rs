@@ -571,3 +571,18 @@ fn a_tree_above_the_limit_of_a_set_keeps_the_order_of_the_binder() {
         shape(&optimized(&catalog, &sql, JoinOrder::Syntactic))
     );
 }
+
+#[test]
+fn a_left_join_is_not_a_node_of_the_join_tree() {
+    let catalog = small_catalog();
+    let plan = bound(
+        &catalog,
+        "SELECT * FROM a LEFT JOIN b ON a.b_id = b.id JOIN c ON b.c_id = c.id",
+    );
+    // The inner join is a tree of two relations: the left join and c.
+    assert!(is_tree_node(&plan), "{}", plan.display_tree());
+    assert_eq!(relation_count(&plan), 2, "{}", plan.display_tree());
+    let simple = bound(&catalog, "SELECT * FROM a LEFT JOIN b ON a.b_id = b.id");
+    assert!(!is_tree_node(&simple), "{}", simple.display_tree());
+    assert_eq!(relation_count(&simple), 1);
+}

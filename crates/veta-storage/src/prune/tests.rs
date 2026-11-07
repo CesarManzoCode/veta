@@ -304,3 +304,53 @@ fn without_filters_or_key_every_granule_is_read() {
     let outside = vec![ScanFilter::equal(0, int(50_000))];
     assert!(prune_part(&part, &outside).is_empty());
 }
+
+/// One key column `a = row number` over 4 full granules: granule `g` holds
+/// `[g·8192, (g+1)·8192)`.
+fn sequential_part(db: &TestDir) -> PartReader {
+    let t = table(db, vec![Field::new("a", DataType::Int64, false)], vec![0]);
+    let rows: Vec<Vec<Value>> = (0..4 * GRANULE_ROWS as i64).map(|i| vec![int(i)]).collect();
+    insert_rows(&t, &rows);
+    Snapshot::take(&t, None).unwrap().into_parts().remove(0)
+}
+
+#[test]
+fn last_granule_of_a_matching_range_is_kept() {
+    let db = TestDir::new("prune-last-of-range");
+    let part = sequential_part(&db);
+    let g = GRANULE_ROWS as i64;
+    // a in [g/2, 2g + g/2] spans granules 0, 1 and 2; granule 2 ends the run.
+    let filters = vec![range(
+        0,
+        Bound::Included(int(g / 2)),
+        Bound::Included(int(2 * g + g / 2)),
+    )];
+    assert_eq!(prune_part(&part, &filters), vec![0, 1, 2]);
+    // A run of one granule: the last value of the part.
+    let last = vec![ScanFilter::equal(0, int(4 * g - 1))];
+    assert_eq!(prune_part(&part, &last), vec![3]);
+    for filters in [filters, last] {
+        let (all, pruned) = compare(&part, &filters);
+        assert_eq!(all, pruned);
+    }
+}
+
+#[test]
+fn granule_range_is_bounded_by_the_next_index_entry() {
+    let db = TestDir::new("prune-next-bound");
+    let part = sequential_part(&db);
+    let g = GRANULE_ROWS as i64;
+    // Values strictly inside granule 1, never equal to an index entry.
+    let inside = vec![ScanFilter::equal(0, int(g + 100))];
+    assert_eq!(prune_part(&part, &inside), vec![1]);
+    let tail = vec![range(
+        0,
+        Bound::Included(int(2 * g - 10)),
+        Bound::Excluded(int(2 * g)),
+    )];
+    assert_eq!(prune_part(&part, &tail), vec![1]);
+    for filters in [inside, tail] {
+        let (all, pruned) = compare(&part, &filters);
+        assert_eq!(all, pruned);
+    }
+}

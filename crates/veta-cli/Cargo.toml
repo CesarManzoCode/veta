@@ -15,3 +15,12 @@ veta-parquet = { path = "../veta-parquet" }
 veta-storage = { path = "../veta-storage" }
 veta-sql = { path = "../veta-sql" }
 veta-exec = { path = "../veta-exec" }
+
+# The mutants of contract §18, re-exported from the crate that holds each one.
+[features]
+mutant-prune-extra-granule = ["veta-storage/mutant-prune-extra-granule"]
+mutant-prune-wrong-bound = ["veta-storage/mutant-prune-wrong-bound"]
+mutant-pushdown-outer = ["veta-sql/mutant-pushdown-outer"]
+mutant-reorder-outer = ["veta-sql/mutant-reorder-outer"]
+mutant-estimate-ignore-null = ["veta-sql/mutant-estimate-ignore-null"]
+mutant-codec-drop-last-block = ["veta-codec/mutant-codec-drop-last-block"]

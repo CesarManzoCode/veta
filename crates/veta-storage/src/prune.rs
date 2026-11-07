@@ -98,11 +98,21 @@ pub fn select_granules(part: &PartReader, filters: &[ScanFilter]) -> Vec<usize> 
     let mut out = Vec::new();
     let mut lo = index_tuple(part, 0);
     for g in 0..granules {
-        let hi = index_tuple(part, g + 1);
-        if key_range_may_match(key, &lo, &hi, filters) {
+        let next = index_tuple(part, g + 1);
+        let hi = &next;
+        // Mutant (contract §18): the range of `g` ends at `idx[g]` instead of `idx[g+1]`.
+        #[cfg(feature = "mutant-prune-wrong-bound")]
+        let hi = &lo;
+        if key_range_may_match(key, &lo, hi, filters) {
             out.push(g);
         }
-        lo = hi;
+        lo = next;
+    }
+    // Mutant (contract §18): the last granule of each run of selected granules is dropped.
+    #[cfg(feature = "mutant-prune-extra-granule")]
+    {
+        let selected = out.clone();
+        out.retain(|g| selected.contains(&(g + 1)));
     }
     out
 }

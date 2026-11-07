@@ -57,6 +57,11 @@ class ParserTest(unittest.TestCase):
                     parser.parse_args([name, "--queries", bad])
                 self.assertEqual(cm.exception.code, 2)
 
+    def test_mutants_and_all(self):
+        parser = build_parser()
+        for name in ("mutants", "all"):
+            self.assertEqual(report_name(parser.parse_args([name])), name)
+
     def test_a_scale_factor_is_required_and_pinned(self):
         for argv in (["tpch-verify"], ["tpch-verify", "--sf", "100"], ["load", "tpch"], ["load", "tpch", "--sf", "2"]):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:

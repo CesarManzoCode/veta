@@ -80,6 +80,12 @@ fn is_tree_node(plan: &LogicalPlan) -> bool {
             kind: JoinKind::Inner | JoinKind::Cross,
             ..
         } => true,
+        // Mutant (contract §18): a `Left` join joins the graph as if it were `Inner`.
+        #[cfg(feature = "mutant-reorder-outer")]
+        LogicalPlan::Join {
+            kind: JoinKind::Left,
+            ..
+        } => true,
         LogicalPlan::Filter { input, .. } => is_tree_node(input),
         LogicalPlan::Project { input, exprs, .. } => {
             exprs.iter().all(|e| picked_column(e).is_some()) && is_tree_node(input)

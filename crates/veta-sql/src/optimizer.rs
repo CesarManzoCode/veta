@@ -519,6 +519,12 @@ fn push_down(plan: LogicalPlan, mut preds: Vec<BoundExpr>) -> LogicalPlan {
                 JoinKind::Left => {
                     // From above, only into the preserved side.
                     for p in preds {
+                        // Mutant (contract §18): also into the side that supplies NULLs.
+                        #[cfg(feature = "mutant-pushdown-outer")]
+                        if only_right(&p) {
+                            to_right.push(rebase(p, width));
+                            continue;
+                        }
                         if only_left(&p) {
                             to_left.push(p);
                         } else {

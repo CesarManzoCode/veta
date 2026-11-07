@@ -7,3 +7,8 @@ license.workspace = true
 [dependencies]
 veta-core = { path = "../veta-core" }
 veta-codec = { path = "../veta-codec" }
+
+# Mutants of contract §18: off by default, each plants one fault.
+[features]
+mutant-prune-extra-granule = []
+mutant-prune-wrong-bound = []

@@ -9,7 +9,7 @@ import resource
 import sys
 import traceback
 
-from harness import clickbench, durability, fetch, meta, oracles, parquet_interop, perf, tpch
+from harness import clickbench, durability, fetch, meta, mutants, oracles, parquet_interop, perf, tpch
 from harness.config import paths
 from harness.report import EXIT_USAGE, FAIL, SKIP, Infra, Report, Skip
 
@@ -111,11 +111,17 @@ def build_parser() -> argparse.ArgumentParser:
         p = commands.add_parser(name, help=text)
         p.set_defaults(func=func, report_name=name)
 
+    p = commands.add_parser("mutants", help="each mutant of the catalog built and run against the checks")
+    p.set_defaults(func=mutants.mutants, report_name="mutants")
+
     p = commands.add_parser("size", help="non-empty lines of the engine and of the harness")
     p.set_defaults(func=meta.size, report_name="size")
 
     p = commands.add_parser("deps", help="only workspace crates and the Python standard library")
     p.set_defaults(func=meta.deps, report_name="deps")
+
+    p = commands.add_parser("all", help="every verification command in order")
+    p.set_defaults(func=mutants.all_commands, report_name="all")
     return parser
 
 

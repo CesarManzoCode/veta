@@ -2,7 +2,19 @@
 
 ## Sin publicar
 
-### K3 — fusiones, recuperación tras cortes, detección de corrupción, escritura Parquet y compresión (2026-11-07)
+### K4 — rendimiento, memoria, multihilo, mutantes y verificación total (sin fecha de cierre)
+
+Nada de esta entrada está medido todavía: ningún mini sprint compiló, corrió ni midió su código. Las mejoras de velocidad son hipótesis, y las cifras y los veredictos llegan con la verificación de cierre del K.
+
+- Ejecutor más rápido (hipótesis de diseño): agrupación por índice directo cuando las estadísticas acotan una clave entera, agrupación por código de diccionario en cadenas, filtros evaluados una vez por entrada de diccionario, materialización tardía en top-N, conjunciones evaluadas de la más barata a la más cara, `LIKE '%lit%'` con SSE2/AVX2 y prefiltro de prefijo literal en expresiones regulares. Cada cambio tiene un test de equivalencia contra el camino general.
+- Arnés de rendimiento: `perf clickbench|tpch` (3 corridas por consulta en los tres motores, `runs/perf-<b>/times.csv` y razones por consulta y media geométrica frente a cada referencia), `rss` (tope de memoria de las 65 consultas con `/usr/bin/time -f %M`) y `threads` (ClickBench con `--threads 1` frente a `--threads 12`).
+- Catálogo de mutantes de §18: seis features de Cargo apagadas por omisión (`mutant-prune-extra-granule` y `mutant-prune-wrong-bound` en veta-storage; `mutant-pushdown-outer`, `mutant-reorder-outer` y `mutant-estimate-ignore-null` en veta-sql; `mutant-codec-drop-last-block` en veta-codec), reexportadas por veta-cli. Cada pieza que rompen tiene además un test normal que fallaría con el mutante activo.
+- Arnés: `mutants` compila cada mutante en `target/mutants/<nombre>`, corre con él los siete comandos de §18 e imprime `MUTANT <nombre> KILLED by <comandos>` o `MUTANT <nombre> SURVIVED`; `all` corre en orden los comandos de §17 y pasa si cada uno es PASS o SKIP.
+- Decisión: para `mutants`, un comando mata al mutante si termina con 1 (FAIL). Un 2 (error de infraestructura) hace que `mutants` termine con 2, porque su veredicto no es fiable. Sin `bin/duckdb`, `mutants` es SKIP.
+- Decisión: `mutants` guarda las corridas con mutante en `runs/mutants/<nombre>/<comando>/` y restaura los `runs/<comando>/` que existían antes. Así, después de `all`, los reportes de los comandos siguen siendo los del binario sin mutar.
+- Decisión: `mutants` y `all` muestran la salida de cada subcomando con el prefijo `<comando>| ` y la guardan entera en `runs/<driver>/logs/`. Así la única línea que empieza con `RESULT` es la del propio driver.
+
+### K3 — fusión, recuperación, escritura Parquet y comandos de durabilidad, Parquet y compresión (sin fecha de cierre)
 
 - Las tablas se fusionan: `veta merge [--final]` en primer plano y `veta merger` en segundo plano, con fusión vertical y la política de ventanas de §7. Fusionar no cambia los resultados. Verificado con `merge-equivalence`: las 43 consultas de ClickBench dan lo mismo con `hits` en 100 partes y en una sola parte fusionada.
 - Las consultas leen durante las fusiones sin diferencias ni errores. Verificado con `concurrent-reader`: ≥ 200 iteraciones con `merger` corriendo, y el número de partes activas bajó.

@@ -446,6 +446,19 @@ fn for_bitpack_width_byte_matches_the_range() {
 }
 
 #[test]
+fn for_bitpack_keeps_the_last_partial_mini_block() {
+    // One full mini-block plus a partial one of 2 values: all of them are written.
+    let n = bitpack::MINI_BLOCK + 2;
+    let values: Vec<i64> = (0..n as i64).map(|i| 1000 + (i * 7) % 61).collect();
+    let x = Vector::from_data(VectorData::Int64(values));
+    let bytes = encode_with(&x, Encoding::ForBitpack).unwrap();
+    let width = bytes[8];
+    assert_eq!(bytes.len(), 9 + bitpack::packed_len(n, width).unwrap());
+    let y = decode(Encoding::ForBitpack, &bytes, &DataType::Int64, n).unwrap();
+    assert!(y == x);
+}
+
+#[test]
 fn wide_range_beyond_64_bits_skips_for_and_delta() {
     let x = Vector::from_data(VectorData::Int128(vec![i128::MIN, 0, i128::MAX]));
     assert!(encode_with(&x, Encoding::ForBitpack).is_err());
