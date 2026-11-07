@@ -9,7 +9,7 @@ import resource
 import sys
 import traceback
 
-from harness import clickbench, durability, fetch, meta, oracles, parquet_interop, tpch
+from harness import clickbench, durability, fetch, meta, oracles, parquet_interop, perf, tpch
 from harness.config import paths
 from harness.report import EXIT_USAGE, FAIL, SKIP, Infra, Report, Skip
 
@@ -40,6 +40,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = commands.add_parser("tpch-verify", help="the 22 TPC-H queries against tpch_answers() or DuckDB")
     p.add_argument("--sf", type=int, required=True, choices=tpch.SCALE_FACTORS)
     p.set_defaults(func=tpch.verify, report_name=tpch.verify_report_name)
+
+    p = commands.add_parser("perf", help="each query 3 times in veta, ClickHouse and DuckDB")
+    p.add_argument("bench", choices=perf.BENCHES)
+    p.set_defaults(func=perf.perf, report_name=perf.perf_report_name)
+
+    p = commands.add_parser("rss", help="max RSS of veta on the 43 ClickBench and 22 TPC-H SF10 queries")
+    p.set_defaults(func=perf.rss, report_name="rss")
+
+    p = commands.add_parser("threads", help="ClickBench with --threads 1 against --threads 12")
+    p.set_defaults(func=perf.threads, report_name="threads")
 
     p = commands.add_parser("tlp", help="random queries against the union of their partitions")
     p.add_argument("--queries", type=oracles.query_count, default=oracles.DEFAULT_QUERIES, metavar="N")

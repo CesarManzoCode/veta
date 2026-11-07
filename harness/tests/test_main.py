@@ -36,6 +36,15 @@ class ParserTest(unittest.TestCase):
         for name in ("join-reorder", "cardinality"):
             self.assertEqual(report_name(parser.parse_args([name])), name)
 
+    def test_perf_commands(self):
+        parser = build_parser()
+        self.assertEqual(report_name(parser.parse_args(["perf", "clickbench"])), "perf-clickbench")
+        self.assertEqual(report_name(parser.parse_args(["perf", "tpch"])), "perf-tpch")
+        for name in ("rss", "threads"):
+            self.assertEqual(report_name(parser.parse_args([name])), name)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["perf", "ssb"])
+
     def test_oracle_commands(self):
         parser = build_parser()
         for name in ("tlp", "optimizer-oracle"):
