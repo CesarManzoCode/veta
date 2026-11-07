@@ -789,3 +789,41 @@ fn malformed_bit_flips_never_panic() {
         }
     }
 }
+
+#[test]
+fn decoding_with_codes_matches_plain_decoding() {
+    let mut rng = Rng::new(41);
+    for &n in &LENGTHS {
+        for distinct in [1u64, 3, 50, 5000] {
+            let values: Vec<veta_core::Value> = (0..n)
+                .map(|_| veta_core::Value::varchar(format!("v{}", rng.below(distinct))))
+                .collect();
+            let vector = Vector::from_values(DataType::Varchar, &values).unwrap();
+            for encoding in [Encoding::Plain, Encoding::Dict, Encoding::Rle] {
+                let bytes = encode_with(&vector, encoding).unwrap();
+                let plain = decode(encoding, &bytes, &DataType::Varchar, n).unwrap();
+                let (kept, codes) =
+                    decode_keeping_codes(encoding, &bytes, &DataType::Varchar, n).unwrap();
+                assert_eq!(kept, plain);
+                match codes {
+                    Some(dict) => {
+                        assert_eq!(encoding, Encoding::Dict);
+                        assert_eq!(dict.codes.len(), n);
+                        for (i, &code) in dict.codes.iter().enumerate() {
+                            assert_eq!(dict.entries.get(code as usize), plain.get(i), "row {i}");
+                        }
+                    }
+                    None => assert_ne!(encoding, Encoding::Dict),
+                }
+                // A truncated block fails the same way in both decoders.
+                if !bytes.is_empty() {
+                    let cut = &bytes[..bytes.len() - 1];
+                    assert_eq!(
+                        decode(encoding, cut, &DataType::Varchar, n).is_err(),
+                        decode_keeping_codes(encoding, cut, &DataType::Varchar, n).is_err()
+                    );
+                }
+            }
+        }
+    }
+}

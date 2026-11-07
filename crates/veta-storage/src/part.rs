@@ -39,9 +39,10 @@ use veta_core::hll::{HLL_REGISTERS, Hll};
 use veta_core::stats::{ColumnStats, SAMPLE_ROWS, sample_positions};
 use veta_core::{Chunk, DataType, Result, Schema, Vector, VetaError};
 
-use crate::block::{read_block, read_block_exact, write_block};
+use crate::block::{read_block, read_block_exact_codes, write_block};
 use crate::colstats::{row_hashes, update_column_stats, update_prefix_hlls};
 use crate::fsutil::{io_err, subdirectories, sync_dir, write_synced};
+use veta_codec::DictCodes;
 
 /// Rows per granule (contract §5.2).
 pub const GRANULE_ROWS: usize = 8192;
@@ -1037,6 +1038,18 @@ impl PartReader {
     /// Reads and verifies the block of `column` in `granule` (contract §5.3): it must
     /// start at its mark, end at the next one, hold the granule's rows and pass its CRC.
     pub fn read_granule(&self, column: usize, granule: usize) -> Result<Vector> {
+        self.read_granule_codes(column, granule, false)
+            .map(|(vector, _)| vector)
+    }
+
+    /// [`PartReader::read_granule`] that keeps `keep_codes` the dictionary and the codes of
+    /// a `Dict` string block, for the executor (contract §12).
+    pub fn read_granule_codes(
+        &self,
+        column: usize,
+        granule: usize,
+        keep_codes: bool,
+    ) -> Result<(Vector, Option<DictCodes>)> {
         let field = self.schema.fields.get(column).ok_or_else(|| {
             VetaError::internal(format!("column {column} out of range in {}", self.label))
         })?;
@@ -1062,12 +1075,13 @@ impl PartReader {
                 io_err(&self.dir.join(bin_file(column)), e)
             }
         })?;
-        read_block_exact(
+        read_block_exact_codes(
             &buf,
             field.data_type,
             field.nullable,
             self.granule_rows(granule),
             &self.label,
+            keep_codes,
         )
     }
 

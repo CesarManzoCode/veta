@@ -6,15 +6,22 @@
 //! narrow a selection vector instead of copying rows; projections evaluate over it; the
 //! probe of a join ([`crate::join`]) turns one batch into any number of batches. Every
 //! worker keeps its own sink state, which the operator combines after the threads end.
+//!
+//! A batch read from a stored table also keeps, for each string column whose block is
+//! `Dict`-encoded, the dictionary and the row codes ([`DictCodes`]): filters evaluate a
+//! string predicate once per entry and the aggregation groups by code. When the first
+//! operator is a filter, a granule decodes the columns of the filter first and the rest
+//! only if some row passes.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
+use veta_codec::DictCodes;
 use veta_core::memory::Reservation;
 use veta_core::predicate::ScanFilter;
-use veta_core::{Chunk, DataType, Result, Vector, VectorData, VetaError};
+use veta_core::{Chunk, DataType, Result, Value, Vector, VectorData, VetaError};
 use veta_parquet::ParquetFile;
 use veta_sql::{BoundExpr, BoundExprKind};
 use veta_storage::prune::prune_part;
@@ -128,15 +135,35 @@ pub(crate) fn parallel_tasks<R: Send>(
 }
 
 /// Rows flowing through a pipeline: a chunk and, after a filter, the rows that remain.
+/// `dicts` is empty or has one entry per column: the codes of a `Dict` string block.
+/// `origin` is `(part, granule)` of a chunk whose row `i` is row `i` of that granule of the
+/// scanned table.
 #[derive(Debug)]
 pub(crate) struct Batch {
     pub chunk: Chunk,
     pub selection: Option<Vec<u32>>,
+    pub dicts: Vec<Option<Arc<DictCodes>>>,
+    pub origin: Option<(u32, u32)>,
 }
 
 impl Batch {
+    /// Every row of `chunk`, without dictionary codes or origin.
+    pub fn new(chunk: Chunk) -> Batch {
+        Batch {
+            chunk,
+            selection: None,
+            dicts: Vec::new(),
+            origin: None,
+        }
+    }
+
     pub fn rows(&self) -> usize {
         self.selection.as_ref().map_or(self.chunk.len, Vec::len)
+    }
+
+    /// The dictionary codes of column `column`, if its block was `Dict`-encoded.
+    pub fn dict(&self, column: usize) -> Option<&DictCodes> {
+        self.dicts.get(column).and_then(Option::as_deref)
     }
 
     /// The selected rows as a chunk of their own.
@@ -173,6 +200,11 @@ impl Evaluator {
         })
     }
 
+    /// The column the expression reads as is, if it is a plain column.
+    pub fn plain_column(&self) -> Option<usize> {
+        self.column
+    }
+
     /// One value per selected row of `batch`.
     pub fn vector<'a>(&self, batch: &'a Batch) -> Result<Cow<'a, Vector>> {
         if batch.selection.is_none()
@@ -192,7 +224,18 @@ impl Evaluator {
 pub(crate) enum ProjectItem {
     /// A column no other output reads: moved when no selection applies.
     Move(usize),
-    Eval(CompiledExpr),
+    /// Any other expression, with the column it is if it is a plain column.
+    Eval(CompiledExpr, Option<usize>),
+}
+
+impl ProjectItem {
+    /// The input column this output is a copy of, if any.
+    fn source_column(&self) -> Option<usize> {
+        match self {
+            ProjectItem::Move(column) => Some(*column),
+            ProjectItem::Eval(_, column) => *column,
+        }
+    }
 }
 
 /// A streaming operator.
@@ -222,7 +265,7 @@ impl StreamOp {
         for expr in exprs {
             items.push(match plain_column(expr) {
                 Some(column) if uses.get(&column) == Some(&1) => ProjectItem::Move(column),
-                _ => ProjectItem::Eval(CompiledExpr::new(expr)?),
+                column => ProjectItem::Eval(CompiledExpr::new(expr)?, column),
             });
         }
         Ok(StreamOp::Project(items))
@@ -231,17 +274,33 @@ impl StreamOp {
     fn apply(&self, batch: &mut Batch) -> Result<()> {
         match self {
             StreamOp::Filter(predicate) => {
-                let selection =
-                    predicate.eval_predicate(&batch.chunk, batch.selection.as_deref())?;
+                let selection = predicate.eval_predicate_with_dicts(
+                    &batch.chunk,
+                    &batch.dicts,
+                    batch.selection.as_deref(),
+                )?;
                 batch.selection = Some(selection);
             }
             StreamOp::Project(items) => {
                 let rows = batch.rows();
                 let selection = batch.selection.as_deref();
+                let dicts = if batch.dicts.is_empty() {
+                    Vec::new()
+                } else {
+                    // Codes are per chunk row: they only follow a column that is not
+                    // gathered.
+                    items
+                        .iter()
+                        .map(|item| match (selection, item.source_column()) {
+                            (None, Some(c)) => batch.dicts.get(c).cloned().flatten(),
+                            _ => None,
+                        })
+                        .collect()
+                };
                 let mut columns = Vec::with_capacity(items.len());
                 for item in items {
                     columns.push(match item {
-                        ProjectItem::Eval(expr) => expr.eval(&batch.chunk, selection)?,
+                        ProjectItem::Eval(expr, _) => expr.eval(&batch.chunk, selection)?,
                         ProjectItem::Move(column) => match selection {
                             Some(selection) => batch.chunk.columns[*column].gather(selection),
                             None => std::mem::replace(
@@ -251,8 +310,13 @@ impl StreamOp {
                         },
                     });
                 }
+                if selection.is_some() {
+                    // The rows were gathered: they are no longer the rows of the granule.
+                    batch.origin = None;
+                }
                 batch.chunk = Chunk::with_len(columns, rows)?;
                 batch.selection = None;
+                batch.dicts = dicts;
             }
             StreamOp::Count(counter) => add(counter, batch.rows() as u64),
             StreamOp::Join(_) => {
@@ -283,13 +347,76 @@ pub(crate) struct TableSource {
 }
 
 impl TableSource {
-    fn read_granule(&self, part: &PartReader, granule: usize) -> Result<Chunk> {
-        let columns = self
-            .columns
-            .iter()
-            .map(|&c| part.read_granule(c, granule))
-            .collect::<Result<Vec<Vector>>>()?;
-        Chunk::with_len(columns, part.granule_rows(granule))
+    /// Reads the columns at positions `which` of a granule into `batch`, whose other columns
+    /// stay as they are. A corrupt block detaches its part (§6.4) before the error returns;
+    /// the query fails with that error whatever the detaching does.
+    fn read_columns(
+        &self,
+        part: &PartReader,
+        granule: usize,
+        which: impl Iterator<Item = usize>,
+        batch: &mut Batch,
+    ) -> Result<()> {
+        for position in which {
+            let (vector, codes) = part
+                .read_granule_codes(self.columns[position], granule, true)
+                .inspect_err(|err| {
+                    if let Err(failure) = detach_corrupt(self.table.dir(), err) {
+                        eprintln!("veta: {failure}");
+                    }
+                })?;
+            if vector.len() != batch.chunk.len {
+                return Err(VetaError::internal(format!(
+                    "granule column has {} rows, expected {}",
+                    vector.len(),
+                    batch.chunk.len
+                )));
+            }
+            batch.chunk.columns[position] = vector;
+            batch.dicts[position] = codes.map(Arc::new);
+        }
+        Ok(())
+    }
+
+    /// A batch of granule `granule` of part number `index`, whose columns are empty
+    /// placeholders until read.
+    fn empty_batch(&self, index: usize, granule: usize) -> Batch {
+        let width = self.columns.len();
+        Batch {
+            chunk: Chunk {
+                columns: (0..width)
+                    .map(|_| Vector::with_capacity(DataType::Boolean, 0))
+                    .collect(),
+                len: self.parts[index].granule_rows(granule),
+            },
+            selection: None,
+            dicts: (0..width).map(|_| None).collect(),
+            origin: Some((index as u32, granule as u32)),
+        }
+    }
+
+    /// Smallest and largest non-NULL value of output column `position` over every part
+    /// (`None` if a part does not know them). A part without non-NULL values adds nothing.
+    fn column_range(&self, position: usize) -> Option<(Value, Value)> {
+        let column = *self.columns.get(position)?;
+        let mut range: Option<(Value, Value)> = None;
+        for part in &self.parts {
+            let stats = part.stats().columns.get(column)?;
+            match (&stats.min, &stats.max) {
+                (Some(min), Some(max)) => {
+                    range = Some(match range {
+                        None => (min.clone(), max.clone()),
+                        Some((lo, hi)) => (
+                            if *min < lo { min.clone() } else { lo },
+                            if *max > hi { max.clone() } else { hi },
+                        ),
+                    });
+                }
+                _ if stats.nulls == stats.rows => {}
+                _ => return None,
+            }
+        }
+        range
     }
 }
 
@@ -318,8 +445,20 @@ impl Source {
         columns: &[usize],
         filters: &[ScanFilter],
     ) -> Result<Source> {
+        Source::table_with(ctx, table_name, columns, columns, filters)
+    }
+
+    /// [`Source::table`] whose snapshot keeps open the files of `open` (a superset of
+    /// `columns`, the columns read), so a later pass can read the others (§6.3).
+    pub fn table_with(
+        ctx: &ExecContext<'_>,
+        table_name: &str,
+        open: &[usize],
+        columns: &[usize],
+        filters: &[ScanFilter],
+    ) -> Result<Source> {
         let table = ctx.db.open_table(table_name)?;
-        let snapshot = Snapshot::take(&table, Some(columns))?;
+        let snapshot = Snapshot::take(&table, Some(open))?;
         for detached in snapshot.detached() {
             eprintln!("{}", detached.message());
         }
@@ -427,6 +566,9 @@ pub(crate) struct Pipeline {
     source: Source,
     ops: Vec<StreamOp>,
     dispatcher: Dispatcher,
+    /// Positions of the columns the first operator reads when it is a filter over a stored
+    /// table that reads only some of the columns: a granule decodes them first.
+    early_columns: Option<Vec<usize>>,
     _hold: Vec<Reservation<'static>>,
 }
 
@@ -437,6 +579,7 @@ impl Pipeline {
             source,
             ops: Vec::new(),
             dispatcher,
+            early_columns: None,
             _hold: Vec::new(),
         }
     }
@@ -450,7 +593,47 @@ impl Pipeline {
     }
 
     pub fn push_op(&mut self, op: StreamOp) {
+        if self.ops.is_empty()
+            && let (StreamOp::Filter(predicate), Source::Table(source)) = (&op, &self.source)
+        {
+            let columns = predicate.columns();
+            if columns.len() < source.columns.len()
+                && columns.iter().all(|&c| c < source.columns.len())
+            {
+                self.early_columns = Some(columns);
+            }
+        }
         self.ops.push(op);
+    }
+
+    /// Smallest and largest non-NULL value of output column `column` according to the
+    /// statistics of the parts read, when the column comes unchanged from a stored table.
+    pub fn column_range(&self, column: usize) -> Option<(Value, Value)> {
+        let mut column = column;
+        for op in self.ops.iter().rev() {
+            match op {
+                StreamOp::Filter(_) | StreamOp::Count(_) => {}
+                StreamOp::Project(items) => column = items.get(column)?.source_column()?,
+                StreamOp::Join(_) => return None,
+            }
+        }
+        match &self.source {
+            Source::Table(source) => source.column_range(column),
+            _ => None,
+        }
+    }
+
+    /// The parts and table columns of a pipeline that reads a stored table, for the late
+    /// materialization of a top-N ([`crate::sort`]).
+    pub fn table_source(&self) -> Option<(&[PartReader], &[usize], &Table)> {
+        match &self.source {
+            Source::Table(source) => Some((
+                source.parts.as_slice(),
+                source.columns.as_slice(),
+                &source.table,
+            )),
+            _ => None,
+        }
     }
 
     /// Stops handing out morsels (the early stop of a `LIMIT`).
@@ -459,11 +642,33 @@ impl Pipeline {
     }
 
     fn push_chunk(&self, chunk: Chunk, sink: &mut dyn FnMut(Batch) -> Result<()>) -> Result<()> {
-        let batch = Batch {
-            chunk,
-            selection: None,
+        self.push_batch(0, Batch::new(chunk), sink)
+    }
+
+    /// Reads granule `granule` of `part` and runs it through the operators. With an early
+    /// filter, the other columns are decoded only if some row passes it.
+    fn push_granule(
+        &self,
+        source: &TableSource,
+        index: usize,
+        granule: usize,
+        sink: &mut dyn FnMut(Batch) -> Result<()>,
+    ) -> Result<()> {
+        let part = &source.parts[index];
+        let mut batch = source.empty_batch(index, granule);
+        let width = source.columns.len();
+        let Some(early) = &self.early_columns else {
+            source.read_columns(part, granule, 0..width, &mut batch)?;
+            return self.push_batch(0, batch, sink);
         };
-        self.push_batch(0, batch, sink)
+        source.read_columns(part, granule, early.iter().copied(), &mut batch)?;
+        self.ops[0].apply(&mut batch)?;
+        if batch.rows() == 0 {
+            return Ok(());
+        }
+        let rest = (0..width).filter(|c| early.binary_search(c).is_err());
+        source.read_columns(part, granule, rest, &mut batch)?;
+        self.push_batch(1, batch, sink)
     }
 
     /// Runs `batch` through the operators from `first` on. Each batch a join probe emits
@@ -502,19 +707,8 @@ impl Pipeline {
                 }
                 add(&ctx.stats.granules_read, (morsel.end - morsel.start) as u64);
                 for granule in morsel.start..morsel.end {
-                    let chunk = match source.read_granule(part, granule) {
-                        Ok(chunk) => chunk,
-                        Err(err) => {
-                            // §6.4: the part is detached before the process exits. The
-                            // query fails with `err` whatever the detaching does.
-                            if let Err(failure) = detach_corrupt(source.table.dir(), &err) {
-                                eprintln!("veta: {failure}");
-                            }
-                            return Err(err);
-                        }
-                    };
-                    add(&ctx.stats.rows_read, chunk.len as u64);
-                    self.push_chunk(chunk, sink)?;
+                    add(&ctx.stats.rows_read, part.granule_rows(granule) as u64);
+                    self.push_granule(source, morsel.part, granule, sink)?;
                 }
                 Ok(())
             }

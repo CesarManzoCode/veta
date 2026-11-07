@@ -9,18 +9,26 @@
 //! `0x00` escaped as `0x00 0xFF` and terminated with `0x00 0x00`, which keeps prefixes first.
 //! `DESC` inverts the value bytes, not the marker. The encoding is prefix-free, so comparing
 //! whole keys compares column by column.
+//!
+//! A top-N keeps no row as values: its heap holds keys, and a row is copied (as a column
+//! slice of its batch) only when the heap takes it. Over a stored table it can read in two
+//! passes ([`LateTopN`]), the columns of the filters and keys first and the others only for
+//! the rows that won.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
 use veta_core::memory::Reservation;
-use veta_core::{Bitmap, Chunk, DataType, Result, Value, Vector, VectorData, VetaError};
-use veta_sql::SortKey;
+use veta_core::predicate::ScanFilter;
+use veta_core::{Bitmap, Chunk, Result, Vector, VectorData, VetaError};
+use veta_sql::{BoundExpr, BoundExprKind, LogicalPlan, SortKey};
+use veta_storage::detach_corrupt;
 
 use crate::context::{ExecContext, new_reservation};
 use crate::group_keys::KeyBuf;
 use crate::pipeline::{
-    Batch, CHUNK_ROWS, Evaluator, Materialized, Pipeline, chunk_bytes, parallel_tasks,
+    Batch, CHUNK_ROWS, Evaluator, Materialized, Pipeline, Source, StreamOp, chunk_bytes,
+    parallel_tasks,
 };
 
 /// A sorted run stops growing at this many bytes, well below the 4 GiB of a string vector.
@@ -445,17 +453,19 @@ pub(crate) fn sort(
     })
 }
 
-/// A row kept by a top-N heap, ordered by its key alone.
+/// A row kept by a top-N heap, ordered by its key and then by `tie`, its position in the
+/// input, so equal keys keep the input order. `slot` says where the row is: a pooled chunk
+/// and a row of it, or nothing in a late top-N, whose `tie` is the row's place in the table.
 #[derive(Debug)]
 struct TopEntry {
-    key: Vec<u8>,
-    row: Vec<Value>,
-    bytes: u64,
+    key: Box<[u8]>,
+    tie: u128,
+    slot: (u32, u32),
 }
 
 impl PartialEq for TopEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.key == other.key && self.tie == other.tie
     }
 }
 
@@ -469,35 +479,103 @@ impl PartialOrd for TopEntry {
 
 impl Ord for TopEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
+        self.key
+            .cmp(&other.key)
+            .then_with(|| self.tie.cmp(&other.tie))
     }
 }
 
-/// Bytes a row kept as values takes.
-fn row_bytes(row: &[Value]) -> u64 {
-    let strings: usize = row
-        .iter()
-        .map(|v| match v {
-            Value::Varchar(bytes) => bytes.len(),
-            _ => 0,
-        })
-        .sum();
-    (size_of_val(row) + strings) as u64
+/// Bytes counted for an entry besides its key.
+const ENTRY_BYTES: u64 = 64;
+
+/// A bounded max-heap of the best `capacity` rows of one worker; its root is the first row
+/// to drop.
+#[derive(Debug)]
+struct TopHeap {
+    heap: BinaryHeap<TopEntry>,
+    capacity: usize,
 }
 
-/// Top-N: each worker keeps the best `offset + limit` rows in a max-heap whose root is the
-/// first row to drop; the heaps are merged and the window `offset..offset + limit` returned.
+impl TopHeap {
+    fn new(capacity: usize) -> TopHeap {
+        TopHeap {
+            heap: BinaryHeap::new(),
+            capacity,
+        }
+    }
+
+    /// Whether a row with this key and tie would be kept, without keeping it.
+    #[inline]
+    fn admits(&self, key: &[u8], tie: u128) -> bool {
+        self.heap.len() < self.capacity
+            || self
+                .heap
+                .peek()
+                .is_some_and(|worst| (key, tie) < (&*worst.key, worst.tie))
+    }
+
+    /// Keeps a row that [`TopHeap::admits`], dropping the worst one if the heap is full.
+    fn push(
+        &mut self,
+        key: &[u8],
+        tie: u128,
+        slot: (u32, u32),
+        mem: &mut Reservation<'static>,
+    ) -> Result<()> {
+        if self.heap.len() >= self.capacity
+            && let Some(worst) = self.heap.pop()
+        {
+            mem.shrink(worst.key.len() as u64 + ENTRY_BYTES);
+        }
+        mem.grow(key.len() as u64 + ENTRY_BYTES)?;
+        self.heap.push(TopEntry {
+            key: key.into(),
+            tie,
+            slot,
+        });
+        Ok(())
+    }
+}
+
+/// The entries `offset..offset + limit` of every worker's heap, in order.
+fn window(heaps: Vec<Vec<TopEntry>>, limit: u64, offset: u64) -> Vec<TopEntry> {
+    let mut all: Vec<TopEntry> = heaps.into_iter().flatten().collect();
+    all.sort_unstable();
+    all.into_iter()
+        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        .take(usize::try_from(limit).unwrap_or(usize::MAX))
+        .collect()
+}
+
+/// Output chunks of up to [`CHUNK_ROWS`] rows taken from `sources` at `picks`.
+fn take_chunks(sources: &[Chunk], picks: &[(u32, u32)]) -> Result<Vec<Chunk>> {
+    let sources: Vec<&Chunk> = sources.iter().collect();
+    picks
+        .chunks(CHUNK_ROWS)
+        .map(|piece| take_rows(&sources, piece))
+        .collect()
+}
+
+/// Top-N: each worker keeps the best `offset + limit` rows in a bounded heap and copies only
+/// the rows its heap takes into a pool of chunks, compacted when it holds many dropped rows;
+/// the heaps are merged and the window `offset..offset + limit` is taken from the pools.
 pub(crate) fn top_n(
     pipeline: Pipeline,
     keys: &[SortKey],
     limit: u64,
     offset: u64,
-    types: &[DataType],
     ctx: &ExecContext<'_>,
 ) -> Result<Materialized> {
     struct Local {
-        heap: BinaryHeap<TopEntry>,
+        heap: TopHeap,
         buf: KeyBuf,
+        /// Copies of the rows the heap took, one chunk per batch until compacted.
+        pool: Vec<Chunk>,
+        pooled_rows: usize,
+        pooled_bytes: u64,
+        /// Morsel of the last batch and the number of that batch within its morsel.
+        last: (usize, u32),
+        taken: Vec<u32>,
         mem: Reservation<'static>,
     }
     let capacity = usize::try_from(offset.saturating_add(limit)).unwrap_or(usize::MAX);
@@ -512,57 +590,312 @@ pub(crate) fn top_n(
         ctx,
         || {
             Ok(Local {
-                heap: BinaryHeap::new(),
+                heap: TopHeap::new(capacity),
+                buf: KeyBuf::default(),
+                pool: Vec::new(),
+                pooled_rows: 0,
+                pooled_bytes: 0,
+                last: (usize::MAX, 0),
+                taken: Vec::new(),
+                mem: new_reservation()?,
+            })
+        },
+        |local, m, batch| {
+            let seq = if local.last.0 == m {
+                local.last.1 + 1
+            } else {
+                0
+            };
+            local.last = (m, seq);
+            encode_keys(&compiled, &batch, &mut local.buf)?;
+            let chunk_index = local.pool.len() as u32;
+            local.taken.clear();
+            for i in 0..batch.rows() {
+                let key = local.buf.key(i);
+                let tie = ((m as u128) << 64) | ((seq as u128) << 32) | i as u128;
+                if !local.heap.admits(key, tie) {
+                    continue;
+                }
+                let slot = (chunk_index, local.taken.len() as u32);
+                local.heap.push(key, tie, slot, &mut local.mem)?;
+                let row = batch.selection.as_ref().map_or(i as u32, |s| s[i]);
+                local.taken.push(row);
+            }
+            if local.taken.is_empty() {
+                return Ok(());
+            }
+            let rows = batch.chunk.gather(&local.taken);
+            let bytes = chunk_bytes(&rows);
+            local.mem.grow(bytes)?;
+            local.pooled_bytes += bytes;
+            local.pooled_rows += rows.len;
+            local.pool.push(rows);
+            if local.pooled_rows > 2 * local.heap.heap.len() + CHUNK_ROWS {
+                // Most pooled rows were dropped from the heap: keep only the live ones.
+                let mut entries = std::mem::take(&mut local.heap.heap).into_vec();
+                let picks: Vec<(u32, u32)> = entries.iter().map(|e| e.slot).collect();
+                let live = take_chunks(&local.pool, &picks)?;
+                for (k, entry) in entries.iter_mut().enumerate() {
+                    entry.slot = ((k / CHUNK_ROWS) as u32, (k % CHUNK_ROWS) as u32);
+                }
+                local.heap.heap = BinaryHeap::from(entries);
+                local.mem.shrink(local.pooled_bytes);
+                local.pooled_bytes = live.iter().map(chunk_bytes).sum();
+                local.mem.grow(local.pooled_bytes)?;
+                local.pooled_rows = live.iter().map(|c| c.len).sum();
+                local.pool = live;
+            }
+            Ok(())
+        },
+    )?;
+    let mut heaps = Vec::with_capacity(locals.len());
+    let mut pools = Vec::new();
+    let mut hold = Vec::with_capacity(locals.len());
+    for local in locals {
+        // Pool chunk numbers become numbers among the pools of every worker.
+        let base = pools.len() as u32;
+        let mut entries = local.heap.heap.into_vec();
+        for entry in &mut entries {
+            entry.slot.0 += base;
+        }
+        heaps.push(entries);
+        pools.extend(local.pool);
+        hold.push(local.mem);
+    }
+    let picks: Vec<(u32, u32)> = window(heaps, limit, offset)
+        .iter()
+        .map(|e| e.slot)
+        .collect();
+    let chunks = take_chunks(&pools, &picks)?;
+    Ok(Materialized { chunks, hold })
+}
+
+/// A top-N over a stored table (`TopN` over filters over a `Scan`, with at most a projection
+/// of plain columns between) read in two passes, the late materialization: the first pass
+/// reads only the columns of the filters and of the sort keys and keeps the place in the
+/// table of the best rows; the second reads the other columns of the granules of the rows
+/// that won, and only those rows are output.
+#[derive(Debug)]
+pub(crate) struct LateTopN {
+    table: String,
+    /// Table column of each output of the scan.
+    scan_columns: Vec<usize>,
+    filters: Vec<ScanFilter>,
+    /// Scan outputs the first pass reads, sorted.
+    needed: Vec<usize>,
+    /// The filters, bottom first, over the columns of the first pass.
+    predicates: Vec<BoundExpr>,
+    /// The sort keys over the columns of the first pass.
+    keys: Vec<SortKey>,
+    /// Scan output of each output column of the top-N.
+    outputs: Vec<usize>,
+}
+
+impl LateTopN {
+    /// The late form of a top-N over `input` with `keys`, if `input` has that shape and some
+    /// output column is neither filtered nor sorted on (otherwise one pass reads the same).
+    pub fn plan(input: &LogicalPlan, keys: &[SortKey]) -> Option<LateTopN> {
+        let (outputs, below) = match input {
+            LogicalPlan::Project { input, exprs, .. } => {
+                let outputs = exprs
+                    .iter()
+                    .map(|e| match &e.kind {
+                        BoundExprKind::Column { index, .. } => Some(*index),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<usize>>>()?;
+                (outputs, &**input)
+            }
+            other => ((0..other.schema().len()).collect(), other),
+        };
+        let mut predicates = Vec::new();
+        let mut node = below;
+        while let LogicalPlan::Filter { input, predicate } = node {
+            predicates.push(predicate.clone());
+            node = &**input;
+        }
+        predicates.reverse();
+        let LogicalPlan::Scan {
+            table,
+            columns,
+            filters,
+            ..
+        } = node
+        else {
+            return None;
+        };
+        if outputs.iter().any(|&o| o >= columns.len()) {
+            return None;
+        }
+        let mut keys: Vec<SortKey> = keys.to_vec();
+        for key in &mut keys {
+            let mut bad = false;
+            key.expr.map_columns(&mut |c| match outputs.get(c) {
+                Some(&o) => o,
+                None => {
+                    bad = true;
+                    0
+                }
+            });
+            if bad {
+                return None;
+            }
+        }
+        let mut needed: Vec<usize> = predicates
+            .iter()
+            .flat_map(BoundExpr::columns)
+            .chain(keys.iter().flat_map(|k| k.expr.columns()))
+            .collect();
+        needed.sort_unstable();
+        needed.dedup();
+        if needed.iter().any(|&c| c >= columns.len())
+            || outputs.iter().all(|o| needed.binary_search(o).is_ok())
+        {
+            return None;
+        }
+        let narrow = |c: usize| needed.binary_search(&c).unwrap_or(usize::MAX);
+        for predicate in &mut predicates {
+            predicate.map_columns(&mut |c| narrow(c));
+        }
+        for key in &mut keys {
+            key.expr.map_columns(&mut |c| narrow(c));
+        }
+        Some(LateTopN {
+            table: table.clone(),
+            scan_columns: columns.clone(),
+            filters: filters.clone(),
+            needed,
+            predicates,
+            keys,
+            outputs,
+        })
+    }
+}
+
+/// `(part, granule, row)` packed into the tie of a late top-N entry.
+fn place_tie(part: u32, granule: u32, row: u32) -> u128 {
+    ((part as u128) << 64) | ((granule as u128) << 32) | row as u128
+}
+
+fn tie_place(tie: u128) -> (u32, u32, u32) {
+    ((tie >> 64) as u32, (tie >> 32) as u32, tie as u32)
+}
+
+/// Runs a [`LateTopN`]: rows `offset..offset + limit` of the top-N, as the one-pass top-N
+/// would give them.
+pub(crate) fn late_top_n(
+    late: &LateTopN,
+    limit: u64,
+    offset: u64,
+    ctx: &ExecContext<'_>,
+) -> Result<Materialized> {
+    struct Local {
+        heap: TopHeap,
+        buf: KeyBuf,
+        mem: Reservation<'static>,
+    }
+    let capacity = usize::try_from(offset.saturating_add(limit)).unwrap_or(usize::MAX);
+    if capacity == 0 {
+        return Ok(Materialized {
+            chunks: Vec::new(),
+            hold: Vec::new(),
+        });
+    }
+    let read: Vec<usize> = late.needed.iter().map(|&p| late.scan_columns[p]).collect();
+    let mut open = late.scan_columns.clone();
+    open.sort_unstable();
+    open.dedup();
+    let mut pipeline = Pipeline::new(Source::table_with(
+        ctx,
+        &late.table,
+        &open,
+        &read,
+        &late.filters,
+    )?);
+    for predicate in &late.predicates {
+        pipeline.push_op(StreamOp::filter(predicate)?);
+    }
+    let compiled = compile_keys(&late.keys)?;
+    let locals = pipeline.run_workers(
+        ctx,
+        || {
+            Ok(Local {
+                heap: TopHeap::new(capacity),
                 buf: KeyBuf::default(),
                 mem: new_reservation()?,
             })
         },
         |local, _m, batch| {
+            let (part, granule) = batch
+                .origin
+                .ok_or_else(|| VetaError::internal("late top-N batch without its granule"))?;
             encode_keys(&compiled, &batch, &mut local.buf)?;
             for i in 0..batch.rows() {
+                let row = batch.selection.as_ref().map_or(i as u32, |s| s[i]);
                 let key = local.buf.key(i);
-                if local.heap.len() >= capacity {
-                    let better = local
-                        .heap
-                        .peek()
-                        .is_some_and(|worst| key < worst.key.as_slice());
-                    if !better {
-                        continue;
-                    }
-                    if let Some(worst) = local.heap.pop() {
-                        local.mem.shrink(worst.bytes);
-                    }
+                let tie = place_tie(part, granule, row);
+                if local.heap.admits(key, tie) {
+                    local.heap.push(key, tie, (0, 0), &mut local.mem)?;
                 }
-                let row_index = batch.selection.as_ref().map_or(i, |s| s[i] as usize);
-                let row = batch.chunk.row(row_index);
-                let bytes = row_bytes(&row) + key.len() as u64 + 64;
-                local.mem.grow(bytes)?;
-                local.heap.push(TopEntry {
-                    key: key.to_vec(),
-                    row,
-                    bytes,
-                });
             }
             Ok(())
         },
     )?;
-    let mut all: Vec<TopEntry> = Vec::new();
-    let mut hold = Vec::with_capacity(locals.len());
+    let mut hold = Vec::with_capacity(locals.len() + 1);
+    let mut heaps = Vec::with_capacity(locals.len());
     for local in locals {
-        all.extend(local.heap.into_vec());
+        heaps.push(local.heap.heap.into_vec());
         hold.push(local.mem);
     }
-    all.sort();
-    let rows: Vec<Vec<Value>> = all
-        .into_iter()
-        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
-        .take(usize::try_from(limit).unwrap_or(usize::MAX))
-        .map(|entry| entry.row)
+    let winners = window(heaps, limit, offset);
+
+    // Second pass: every output column of the granules the winners are in.
+    let (parts, _, table) = pipeline
+        .table_source()
+        .ok_or_else(|| VetaError::internal("late top-N without a stored table"))?;
+    let mut granules: Vec<(u32, u32)> = winners
+        .iter()
+        .map(|e| {
+            let (part, granule, _) = tie_place(e.tie);
+            (part, granule)
+        })
         .collect();
-    let mut chunks = Vec::new();
-    for rows in rows.chunks(CHUNK_ROWS) {
-        chunks.push(Chunk::from_rows(types, rows)?);
+    granules.sort_unstable();
+    granules.dedup();
+    let columns: Vec<usize> = late.outputs.iter().map(|&o| late.scan_columns[o]).collect();
+    let pieces = parallel_tasks(ctx.threads, granules.len(), |g| {
+        let (p, granule) = granules[g];
+        let part = &parts[p as usize];
+        let vectors = columns
+            .iter()
+            .map(|&c| {
+                part.read_granule(c, granule as usize).inspect_err(|err| {
+                    // §6.4, as in the scan: the part is detached and the query fails.
+                    if let Err(failure) = detach_corrupt(table.dir(), err) {
+                        eprintln!("veta: {failure}");
+                    }
+                })
+            })
+            .collect::<Result<Vec<Vector>>>()?;
+        Chunk::with_len(vectors, part.granule_rows(granule as usize))
+    })?;
+    let mut mem = new_reservation()?;
+    for piece in &pieces {
+        mem.grow(chunk_bytes(piece))?;
     }
+    let picks = winners
+        .iter()
+        .map(|e| {
+            let (part, granule, row) = tie_place(e.tie);
+            let g = granules
+                .binary_search(&(part, granule))
+                .map_err(|_| VetaError::internal("late top-N lost a granule"))?;
+            Ok((g as u32, row))
+        })
+        .collect::<Result<Vec<(u32, u32)>>>()?;
+    let chunks = take_chunks(&pieces, &picks)?;
+    drop(pieces);
+    hold.push(mem);
     Ok(Materialized { chunks, hold })
 }
 
@@ -571,9 +904,9 @@ mod tests {
     use super::*;
     use crate::context::ExecStats;
     use crate::database::Database;
-    use crate::pipeline::{Source, collect};
+    use crate::pipeline::collect;
     use veta_core::rand::Rng;
-    use veta_sql::BoundExpr;
+    use veta_core::{DataType, Value};
 
     fn sort_key(index: usize, data_type: DataType, desc: bool, nulls_first: bool) -> SortKey {
         SortKey {
@@ -584,10 +917,7 @@ mod tests {
     }
 
     fn batch_of(vectors: Vec<Vector>) -> Batch {
-        Batch {
-            chunk: Chunk::new(vectors).unwrap(),
-            selection: None,
-        }
+        Batch::new(Chunk::new(vectors).unwrap())
     }
 
     /// Sorted order of one column per its encoded keys, compared with the value order.
@@ -766,7 +1096,6 @@ mod tests {
 
     #[test]
     fn top_n_returns_the_window_of_the_full_sort() {
-        let types = [DataType::Int64, DataType::Int64];
         for threads in [1, 8] {
             let db = Database::open("unused");
             let stats = ExecStats::default();
@@ -783,7 +1112,6 @@ mod tests {
                 &[sort_key(0, DataType::Int64, false, false)],
                 25,
                 10,
-                &types,
                 &ctx,
             )
             .unwrap();
@@ -800,11 +1128,67 @@ mod tests {
                 &[sort_key(0, DataType::Int64, false, false)],
                 0,
                 0,
-                &types,
                 &ctx,
             )
             .unwrap();
             assert!(empty.chunks.is_empty());
+        }
+    }
+
+    #[test]
+    fn top_n_keeps_the_input_order_between_equal_keys() {
+        // Keys with many ties, then strictly decreasing keys: every row enters the heap, so
+        // the pool of copied rows is compacted several times.
+        for decreasing in [false, true] {
+            let mut rng = Rng::new(13);
+            let mut all: Vec<(i64, i64)> = Vec::new();
+            let mut chunks = Vec::new();
+            for c in 0..80i64 {
+                let keys: Vec<i64> = (0..250)
+                    .map(|i| {
+                        if decreasing {
+                            -(c * 250 + i)
+                        } else {
+                            rng.range_i64(0, 9)
+                        }
+                    })
+                    .collect();
+                let positions: Vec<i64> = (0..250).map(|i| c * 250 + i).collect();
+                all.extend(keys.iter().copied().zip(positions.iter().copied()));
+                chunks.push(
+                    Chunk::new(vec![
+                        Vector::from_data(VectorData::Int64(keys)),
+                        Vector::from_data(VectorData::Int64(positions)),
+                    ])
+                    .unwrap(),
+                );
+            }
+            // A stable sort keeps the input order between equal keys.
+            all.sort_by_key(|&(k, _)| k);
+            let expected: Vec<(Value, Value)> = all[30..130]
+                .iter()
+                .map(|&(k, p)| (Value::Int64(k), Value::Int64(p)))
+                .collect();
+            for threads in [1, 8] {
+                let db = Database::open("unused");
+                let stats = ExecStats::default();
+                let ctx = ExecContext {
+                    db: &db,
+                    threads,
+                    stats: &stats,
+                    prune: true,
+                    profile: None,
+                };
+                let out = top_n(
+                    Pipeline::new(Source::chunks(chunks.clone())),
+                    &[sort_key(0, DataType::Int64, false, false)],
+                    100,
+                    30,
+                    &ctx,
+                )
+                .unwrap();
+                assert_eq!(first_two(&out.chunks), expected, "threads {threads}");
+            }
         }
     }
 

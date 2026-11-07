@@ -519,6 +519,44 @@ pub fn decode(
     Ok(Vector::from_data(data))
 }
 
+/// The dictionary and the row codes of a `Dict` string block: row `i` is
+/// `entries[codes[i]]`. A NULL row has the code of the empty string its slot was normalized
+/// to, so the validity map of the block still decides which rows are NULL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DictCodes {
+    /// One `Varchar` value per dictionary entry, in order of first appearance.
+    pub entries: Vector,
+    pub codes: Vec<u32>,
+}
+
+/// [`decode`] that also returns the dictionary and the codes of a `Dict` string block, so
+/// the executor can evaluate a predicate once per entry or group by code. Every other
+/// block gives `None`. The vector and the errors are those of [`decode`].
+pub fn decode_keeping_codes(
+    encoding: Encoding,
+    bytes: &[u8],
+    data_type: &DataType,
+    rows: usize,
+) -> Result<(Vector, Option<DictCodes>)> {
+    if encoding != Encoding::Dict || *data_type != DataType::Varchar {
+        return Ok((decode(encoding, bytes, data_type, rows)?, None));
+    }
+    let mut r = Reader::new(bytes);
+    let n = get_count(&mut r, rows, "dictionary entries")?;
+    let dict = match r.u8()? {
+        0 => get_plain_strs(&mut r, n)?,
+        tag => return Err(malformed(format!("invalid string sub-encoding {tag}"))),
+    };
+    let codes = get_codes(&mut r, rows, n as u64, "dictionary code")?;
+    r.finish()?;
+    let strings: Vec<&[u8]> = codes.iter().map(|&c| dict[c as usize]).collect();
+    let vector = Vector::from_data(strings_to_data(&strings)?);
+    let entries = Vector::from_data(strings_to_data(&dict)?);
+    // Codes are below `n ≤ rows`, which fits in `u32` (a block holds at most a granule).
+    let codes = codes.into_iter().map(|c| c as u32).collect();
+    Ok((vector, Some(DictCodes { entries, codes })))
+}
+
 fn byte_len(count: usize, width: usize) -> Result<usize> {
     count
         .checked_mul(width)

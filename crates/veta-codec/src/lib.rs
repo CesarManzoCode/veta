@@ -12,4 +12,4 @@ pub mod snappy;
 pub mod vlz;
 
 pub use bench::{BenchResult, Compressor, bench_compressor};
-pub use encoding::{Encoding, decode, encode, encode_with};
+pub use encoding::{DictCodes, Encoding, decode, decode_keeping_codes, encode, encode_with};

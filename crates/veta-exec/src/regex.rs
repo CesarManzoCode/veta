@@ -5,6 +5,11 @@
 //! (ClickHouse sets `dot_nl`). `^` and `$` only match at the start and the end of the whole
 //! string. Repetitions are greedy and the leftmost match wins, with the priorities of
 //! re2/Perl (leftmost-first). Any syntax outside §10.3 is a compile error.
+//!
+//! Before the machine runs, two prefilters discard texts that cannot match: an anchored
+//! pattern needs its literal prefix at the start, and every match contains the longest
+//! literal run the pattern requires. The machine keeps its thread lists and capture slots in
+//! a [`Cache`] reused across rows, so a search allocates nothing once the cache is warm.
 
 use veta_core::{Result, VetaError};
 
@@ -479,6 +484,31 @@ fn required_literal(ast: &Ast) -> Option<Vec<u8>> {
     (!best.is_empty()).then_some(best)
 }
 
+/// Bytes an anchored pattern must start with: the literal bytes right after the leading
+/// `^`, up to the first item that is not a single required byte.
+fn anchored_prefix(ast: &Ast) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    let Ast::Concat(items) = ast else {
+        return prefix;
+    };
+    if items.first() != Some(&Ast::Start) {
+        return prefix;
+    }
+    for item in &items[1..] {
+        match item {
+            Ast::Byte(b) => prefix.push(*b),
+            Ast::Repeat { ast, min, .. } if *min >= 1 && matches!(**ast, Ast::Byte(_)) => {
+                if let Ast::Byte(b) = **ast {
+                    prefix.push(b);
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    prefix
+}
+
 /// A compiled pattern.
 #[derive(Debug)]
 pub struct Regex {
@@ -489,6 +519,8 @@ pub struct Regex {
     anchored: bool,
     /// Bytes every match contains (prefilter).
     required: Option<Finder>,
+    /// Bytes an anchored pattern starts with (prefilter); empty if none.
+    prefix: Vec<u8>,
 }
 
 /// Reusable scratch space of the Pike machine; one per thread.
@@ -498,6 +530,16 @@ pub struct Cache {
     nlist: Threads,
     stack: Vec<Frame>,
     scratch: Vec<Option<usize>>,
+    /// Capture slots of the last successful search.
+    matched: Vec<Option<usize>>,
+}
+
+impl Cache {
+    /// Capture slots of the last successful [`Regex::search`] (`2i`, `2i+1` = start and end
+    /// of group `i`; group 0 is the whole match).
+    pub fn captures(&self) -> &[Option<usize>] {
+        &self.matched
+    }
 }
 
 #[derive(Debug, Default)]
@@ -572,6 +614,7 @@ impl Regex {
             groups: parser.groups,
             anchored: starts_anchored(&ast),
             required: required_literal(&ast).map(Finder::new),
+            prefix: anchored_prefix(&ast),
         })
     }
 
@@ -586,24 +629,29 @@ impl Regex {
 
     /// Whether `text` contains a match.
     pub fn is_match(&self, text: &[u8], cache: &mut Cache) -> bool {
-        self.search(text, 0, cache).is_some()
+        self.search(text, 0, cache)
     }
 
-    /// Leftmost-first match starting the search at `start`; returns the capture slots
-    /// (`2i`, `2i+1` = start and end of group `i`, group 0 is the whole match).
-    pub fn search(
-        &self,
-        text: &[u8],
-        start: usize,
-        cache: &mut Cache,
-    ) -> Option<Vec<Option<usize>>> {
+    /// Leftmost-first match starting the search at `start`; on a match the capture slots
+    /// are in [`Cache::captures`].
+    pub fn search(&self, text: &[u8], start: usize, cache: &mut Cache) -> bool {
+        self.search_with(text, start, cache, true)
+    }
+
+    /// [`Regex::search`] with the prefilters on or off; both give the same answer.
+    fn search_with(&self, text: &[u8], start: usize, cache: &mut Cache, prefilter: bool) -> bool {
         if self.anchored && start > 0 {
-            return None;
+            return false;
         }
-        if let Some(required) = &self.required
-            && required.find(&text[start..]).is_none()
-        {
-            return None;
+        if prefilter {
+            if !text.starts_with(&self.prefix) {
+                return false;
+            }
+            if let Some(required) = &self.required
+                && required.find(&text[start..]).is_none()
+            {
+                return false;
+            }
         }
         self.pike(text, start, cache)
     }
@@ -657,7 +705,8 @@ impl Regex {
         }
     }
 
-    fn pike(&self, text: &[u8], start: usize, cache: &mut Cache) -> Option<Vec<Option<usize>>> {
+    /// The Pike machine; the captures of a match go to `cache.matched`.
+    fn pike(&self, text: &[u8], start: usize, cache: &mut Cache) -> bool {
         let slots = self.slots();
         let n = self.prog.len();
         let Cache {
@@ -665,16 +714,19 @@ impl Regex {
             nlist,
             stack,
             scratch,
+            matched: best,
         } = cache;
         clist.reset(n, slots);
         nlist.reset(n, slots);
         scratch.clear();
         scratch.resize(slots, None);
-        let mut matched: Option<Vec<Option<usize>>> = None;
+        best.clear();
+        best.resize(slots, None);
+        let mut matched = false;
         let len = text.len();
         let mut pos = start;
         loop {
-            if matched.is_none() && (!self.anchored || pos == 0) {
+            if !matched && (!self.anchored || pos == 0) {
                 scratch.iter_mut().for_each(|s| *s = None);
                 self.add(clist, stack, scratch, 0, pos, len);
             }
@@ -685,7 +737,8 @@ impl Regex {
             for &pc in &clist.dense {
                 let step = match (&self.prog[pc], byte) {
                     (Inst::Match, _) => {
-                        matched = Some(clist.caps[pc * slots..(pc + 1) * slots].to_vec());
+                        best.copy_from_slice(&clist.caps[pc * slots..(pc + 1) * slots]);
+                        matched = true;
                         // Lower-priority threads are cut.
                         break;
                     }
@@ -708,10 +761,11 @@ impl Regex {
         }
         // Threads left in the list after the end of the text only matter if they reach
         // `Match` without consuming, which `add` already resolved at `pos == len`.
-        if matched.is_none() {
+        if !matched {
             for &pc in &clist.dense {
                 if self.prog[pc] == Inst::Match {
-                    matched = Some(clist.caps[pc * slots..(pc + 1) * slots].to_vec());
+                    best.copy_from_slice(&clist.caps[pc * slots..(pc + 1) * slots]);
+                    matched = true;
                     break;
                 }
             }
@@ -731,14 +785,15 @@ impl Regex {
     ) {
         let mut pos = 0;
         while pos < text.len() {
-            let Some(caps) = self.search(text, pos, cache) else {
+            if !self.search(text, pos, cache) {
                 break;
-            };
+            }
+            let caps = cache.captures();
             let (Some(s), Some(e)) = (caps[0], caps[1]) else {
                 break;
             };
             out.extend_from_slice(&text[pos..s]);
-            replacement.write(text, &caps, out);
+            replacement.write(text, caps, out);
             pos = e;
             if s == e {
                 if pos < text.len() {
@@ -923,6 +978,62 @@ mod tests {
         }
         let re = Regex::new(b"(a)").unwrap();
         assert!(Replacement::new(br"\2", &re).is_err());
+    }
+
+    #[test]
+    fn prefilters_never_change_the_answer() {
+        use veta_core::rand::Rng;
+        let patterns = [
+            Q29,
+            r"^ab+c",
+            r"^a",
+            r"x(abc)+y",
+            r"(\d+)-(\d+)",
+            r"cat|dog",
+            r"^(?:ab|cd)+$",
+            r"a.c$",
+            r"[^a-c]b",
+            r"bb*a",
+        ];
+        let mut rng = Rng::new(29);
+        let alphabet = b"abcdxy-1/:htps.w";
+        let mut texts: Vec<Vec<u8>> = vec![
+            b"https://www.example.com/path".to_vec(),
+            b"http://example.org/".to_vec(),
+            b"ftp://x/".to_vec(),
+            Vec::new(),
+        ];
+        for _ in 0..400 {
+            let len = rng.below(24) as usize;
+            texts.push(
+                (0..len)
+                    .map(|_| alphabet[rng.below(alphabet.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        let mut with = Cache::default();
+        let mut without = Cache::default();
+        for pattern in patterns {
+            let re = Regex::new(pattern.as_bytes()).unwrap();
+            for text in &texts {
+                for start in 0..=text.len().min(3) {
+                    let a = re.search_with(text, start, &mut with, true);
+                    let b = re.search_with(text, start, &mut without, false);
+                    assert_eq!(a, b, "{pattern} on {:?} from {start}", text);
+                    if a {
+                        assert_eq!(with.captures(), without.captures(), "{pattern}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn anchored_prefix_of_patterns() {
+        assert_eq!(Regex::new(Q29.as_bytes()).unwrap().prefix, b"http".to_vec());
+        assert_eq!(Regex::new(b"^ab+c").unwrap().prefix, b"ab".to_vec());
+        assert!(Regex::new(b"ab").unwrap().prefix.is_empty());
+        assert!(Regex::new(b"^(a)").unwrap().prefix.is_empty());
     }
 
     #[test]

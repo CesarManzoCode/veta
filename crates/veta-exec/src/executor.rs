@@ -111,14 +111,11 @@ fn execute_plan(plan: &LogicalPlan, ctx: &ExecContext<'_>) -> Result<Materialize
             keys,
             limit,
             offset,
-        } => sort::top_n(
-            build_pipeline(input, ctx)?,
-            keys,
-            *limit,
-            *offset,
-            &input.schema().data_types(),
-            ctx,
-        ),
+        } => match sort::LateTopN::plan(input, keys).filter(|_| ctx.profile.is_none()) {
+            // EXPLAIN ANALYZE counts the rows of every node, so it keeps the one-pass form.
+            Some(late) => sort::late_top_n(&late, *limit, *offset, ctx),
+            None => sort::top_n(build_pipeline(input, ctx)?, keys, *limit, *offset, ctx),
+        },
         LogicalPlan::Limit {
             input,
             limit,
@@ -755,6 +752,204 @@ mod tests {
             assert_eq!(by_cost, sorted_rows(&db, sql, syntactic), "{sql}");
             assert_eq!(by_cost, sorted_rows(&db, sql, off), "{sql}");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `t(id, k, s, w)` in three parts: `k` with ties and NULLs, `s` and `w` strings.
+    fn top_n_table(tag: &str) -> (Database, std::path::PathBuf) {
+        let (db, dir) = database(tag);
+        create(
+            &db,
+            "CREATE TABLE t (id BIGINT NOT NULL, k BIGINT, s VARCHAR, w VARCHAR, PRIMARY KEY (id))",
+        );
+        let table = db.open_table("t").unwrap();
+        let mut rng = veta_core::rand::Rng::new(77);
+        for batch in 0..3i64 {
+            let rows: Vec<Vec<Value>> = (0..9000)
+                .map(|i| {
+                    let k = if rng.next_bool(0.05) {
+                        Value::Null
+                    } else {
+                        Value::Int64(rng.range_i64(0, 40))
+                    };
+                    let s = Value::varchar(["abc", "xyz", "bab", ""][rng.below(4) as usize]);
+                    let w = Value::varchar(format!("w{}", rng.below(1000)));
+                    vec![Value::Int64(batch * 100_000 + i), k, s, w]
+                })
+                .collect();
+            let types = [
+                DataType::Int64,
+                DataType::Int64,
+                DataType::Varchar,
+                DataType::Varchar,
+            ];
+            insert(&table, &Chunk::from_rows(&types, &rows).unwrap()).unwrap();
+        }
+        (db, dir)
+    }
+
+    fn rows_of(chunks: &[Chunk]) -> Vec<Vec<Value>> {
+        chunks
+            .iter()
+            .flat_map(|c| (0..c.len).map(move |i| c.row(i)))
+            .collect()
+    }
+
+    /// The top-N node of an optimized plan.
+    fn find_top_n(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+        match plan {
+            LogicalPlan::TopN { .. } => Some(plan),
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. } => find_top_n(input),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn late_top_n_matches_the_one_pass_top_n_and_the_full_sort() {
+        let (db, dir) = top_n_table("late-top-n");
+        let cases = [
+            ("SELECT * FROM t WHERE s LIKE '%b%' ORDER BY k DESC", 7, 3),
+            ("SELECT id, w FROM t ORDER BY k", 20, 0),
+            (
+                "SELECT w, id, k FROM t WHERE k > 3 ORDER BY k NULLS FIRST",
+                15,
+                40,
+            ),
+            ("SELECT * FROM t WHERE s <> '' ORDER BY k, s DESC", 9000, 5),
+        ];
+        for (sql, limit, offset) in cases {
+            let parse = |sql: &str| {
+                let Statement::Query(q) = parse_statement(sql).unwrap() else {
+                    panic!("not a query: {sql}");
+                };
+                optimize(
+                    bind_query(&db, &q).unwrap(),
+                    OptimizerOptions::default(),
+                    &db,
+                )
+            };
+            // The full sort on one thread keeps the table order between equal keys.
+            let full = optimized_query(&db, sql, 1, true).unwrap();
+            let start = (offset as usize).min(full.len());
+            let end = (start + limit as usize).min(full.len());
+            let expected = full[start..end].to_vec();
+            let limited = format!("{sql} LIMIT {limit} OFFSET {offset}");
+            let plan = parse(&limited);
+            let Some(LogicalPlan::TopN { input, keys, .. }) = find_top_n(&plan) else {
+                panic!("no TopN in the plan of {limited}");
+            };
+            let late = sort::LateTopN::plan(input, keys)
+                .unwrap_or_else(|| panic!("{limited} has no late form"));
+            for threads in [1, 8] {
+                let stats = ExecStats::default();
+                let ctx = ExecContext {
+                    db: &db,
+                    threads,
+                    stats: &stats,
+                    prune: true,
+                    profile: None,
+                };
+                let two_pass = sort::late_top_n(&late, limit, offset, &ctx).unwrap();
+                let one_pass = sort::top_n(
+                    build_pipeline(input, &ctx).unwrap(),
+                    keys,
+                    limit,
+                    offset,
+                    &ctx,
+                )
+                .unwrap();
+                assert_eq!(rows_of(&two_pass.chunks), expected, "{limited}, {threads}");
+                assert_eq!(rows_of(&one_pass.chunks), expected, "{limited}, {threads}");
+                assert_eq!(
+                    optimized_query(&db, &limited, threads, true).unwrap(),
+                    expected,
+                    "{limited}, {threads}"
+                );
+            }
+        }
+        // Sorting on every output column leaves nothing for a second pass.
+        let Statement::Query(q) = parse_statement("SELECT k FROM t ORDER BY k LIMIT 3").unwrap()
+        else {
+            panic!("not a query");
+        };
+        let plan = optimize(
+            bind_query(&db, &q).unwrap(),
+            OptimizerOptions::default(),
+            &db,
+        );
+        if let Some(LogicalPlan::TopN { input, keys, .. }) = find_top_n(&plan) {
+            assert!(sort::LateTopN::plan(input, keys).is_none());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn early_filters_and_array_aggregation_give_the_rows_of_the_plain_paths() {
+        let (db, dir) = top_n_table("early-filter");
+        for sql in [
+            "SELECT count(*), sum(id) FROM t WHERE s = 'xyz'",
+            "SELECT id, w FROM t WHERE k = 7 AND s LIKE '%b%' ORDER BY id",
+            "SELECT k, count(*), min(w) FROM t GROUP BY k ORDER BY k",
+            "SELECT k, count(*) FROM t WHERE w LIKE 'w1%' GROUP BY k ORDER BY k",
+            "SELECT s, count(*) FROM t WHERE s <> '' GROUP BY s ORDER BY s",
+            // `id` is NOT NULL and its range fits the array of the aggregation.
+            "SELECT id, count(*), max(w) FROM t WHERE k = 3 GROUP BY id ORDER BY id",
+        ] {
+            // The optimizer off keeps the filters and projections in their written form;
+            // both plans run the same paths, so they only check each other with the rows
+            // computed below by hand.
+            for threads in [1, 8] {
+                assert_eq!(
+                    optimized_query(&db, sql, threads, true).unwrap(),
+                    optimized_query(&db, sql, threads, false).unwrap(),
+                    "{sql}"
+                );
+            }
+        }
+        // Rows by hand: every row of the table, then the query in Rust.
+        let all = optimized_query(&db, "SELECT id, k, s, w FROM t ORDER BY id", 1, true).unwrap();
+        let mut counts: std::collections::BTreeMap<Value, i64> = Default::default();
+        for row in &all {
+            *counts.entry(row[1].clone()).or_insert(0) += 1;
+        }
+        let mut expected: Vec<Vec<Value>> = counts
+            .into_iter()
+            .map(|(k, c)| vec![k, Value::Int64(c)])
+            .collect();
+        // NULLS LAST in ascending order.
+        expected.rotate_left(usize::from(
+            expected.first().is_some_and(|r| r[0].is_null()),
+        ));
+        assert_eq!(
+            optimized_query(
+                &db,
+                "SELECT k, count(*) FROM t GROUP BY k ORDER BY k",
+                4,
+                true
+            )
+            .unwrap(),
+            expected
+        );
+        let filtered: Vec<Vec<Value>> = all
+            .iter()
+            .filter(|r| {
+                r[1] == Value::Int64(7) && r[2].as_bytes().is_some_and(|s| s.contains(&b'b'))
+            })
+            .map(|r| vec![r[0].clone(), r[3].clone()])
+            .collect();
+        assert_eq!(
+            optimized_query(
+                &db,
+                "SELECT id, w FROM t WHERE k = 7 AND s LIKE '%b%' ORDER BY id",
+                4,
+                true
+            )
+            .unwrap(),
+            filtered
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

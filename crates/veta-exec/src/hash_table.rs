@@ -4,6 +4,9 @@
 //! Both assign consecutive ids `0, 1, …` in insertion order and probe linearly with at
 //! most half of the slots in use. The low bits of the hash pick the slot; the top bits
 //! pick the radix partition, so the two are independent.
+//!
+//! [`ArrayTable`] is the aggregation by array: a single integer key whose range the part
+//! statistics bound indexes its slot directly, without hashing, and assigns ids the same way.
 
 use veta_core::hash::{hash_u64, hash_u128};
 
@@ -157,6 +160,105 @@ impl<K: FixedKey> FixedTable<K> {
     /// Bytes held by the table.
     pub fn bytes(&self) -> u64 {
         (self.keys.capacity() * size_of::<K>() + self.ids.capacity() * 4) as u64
+    }
+}
+
+/// Largest key range [`ArrayTable`] takes: 4 bytes per slot, 1 MiB per worker.
+pub(crate) const MAX_ARRAY_SLOTS: u64 = 1 << 18;
+
+/// Direct-index table of a one-column packed key (the layout of `crate::group_keys`): the
+/// value, `width` bytes sign-extended, picks slot `value − min`; a NULL (the flag bit at
+/// `null_bit`) takes the slot after the range. Ids are assigned in insertion order, as in
+/// [`FixedTable`], so converting to one keeps every id.
+#[derive(Debug)]
+pub(crate) struct ArrayTable {
+    min: i64,
+    /// Slots for the values `min..=min + span − 1`.
+    span: u64,
+    value_bits: u32,
+    null_bit: Option<u32>,
+    /// `id + 1` of each slot; 0 is empty.
+    ids: Vec<u32>,
+    /// Packed key of each id.
+    keys: Vec<u64>,
+}
+
+impl ArrayTable {
+    /// A table for values in `min..=max` of a column of `width` bytes (at most 8) whose
+    /// NULL flag, if nullable, is bit `null_bit`; `None` if the range has more than
+    /// [`MAX_ARRAY_SLOTS`] values.
+    pub fn new(min: i64, max: i64, width: u32, null_bit: Option<u32>) -> Option<ArrayTable> {
+        if max < min || width == 0 || width > 8 {
+            return None;
+        }
+        let span = (max as i128 - min as i128 + 1) as u128;
+        if span > MAX_ARRAY_SLOTS as u128 {
+            return None;
+        }
+        let span = span as u64;
+        Some(ArrayTable {
+            min,
+            span,
+            value_bits: width * 8,
+            null_bit,
+            ids: vec![0; span as usize + 1],
+            keys: Vec::new(),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// The slot of a packed key, `None` if its value is outside the range.
+    #[inline]
+    fn slot(&self, key: u64) -> Option<usize> {
+        if let Some(bit) = self.null_bit
+            && (key >> bit) & 1 == 1
+        {
+            return Some(self.span as usize);
+        }
+        let shift = 64 - self.value_bits;
+        let value = ((key << shift) as i64) >> shift;
+        let offset = (value as i128 - self.min as i128) as u128;
+        (offset < self.span as u128).then_some(offset as usize)
+    }
+
+    /// The id of `key`, inserting it with the next id if it is new; `None` if its value is
+    /// outside the range (the table is then left as it was).
+    #[inline]
+    pub fn find_or_insert(&mut self, key: u64) -> Option<u32> {
+        let slot = self.slot(key)?;
+        let id = self.ids[slot];
+        if id != 0 {
+            return Some(id - 1);
+        }
+        let new = self.keys.len() as u32;
+        self.ids[slot] = new + 1;
+        self.keys.push(key);
+        Some(new)
+    }
+
+    /// `(key, id)` of every key, in id order.
+    pub fn entries(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
+        self.keys
+            .iter()
+            .enumerate()
+            .map(|(id, &key)| (key, id as u32))
+    }
+
+    /// The same keys with the same ids in a hash table.
+    pub fn to_hash_table(&self) -> FixedTable<u64> {
+        let mut table = FixedTable::with_slots(2 * self.keys.len().max(512));
+        for &key in &self.keys {
+            table.find_or_insert(key);
+        }
+        table
+    }
+
+    /// Bytes held by the table.
+    pub fn bytes(&self) -> u64 {
+        (self.ids.capacity() * 4 + self.keys.capacity() * 8) as u64
     }
 }
 
@@ -342,6 +444,75 @@ mod tests {
             );
         }
         assert_eq!(FixedTable::<u128>::with_slots(4).find(0), None);
+    }
+
+    #[test]
+    fn specialized_tables_match_a_general_hash_map() {
+        use std::collections::HashMap;
+        use veta_core::rand::Rng;
+        let mut rng = Rng::new(3);
+        for round in 0..20 {
+            let distinct = 1 + rng.below(if round % 2 == 0 { 50 } else { 20_000 });
+            let mut narrow = FixedTable::<u64>::with_slots(2);
+            let mut wide = FixedTable::<u128>::with_slots(2);
+            let mut bytes = BytesTable::with_slots(2);
+            let mut general: HashMap<u128, u32> = HashMap::new();
+            for _ in 0..30_000 {
+                let low = rng.below(distinct);
+                let key = ((low as u128) << 64 | low as u128) ^ 0x5555;
+                let expected = general.len() as u32;
+                let expected = *general.entry(key).or_insert(expected);
+                assert_eq!(narrow.find_or_insert(low), expected);
+                assert_eq!(wide.find_or_insert(key), expected);
+                let text = key.to_le_bytes();
+                assert_eq!(bytes.find_or_insert(&text, hash_bytes(&text)), expected);
+            }
+            assert_eq!(narrow.len(), general.len());
+            assert_eq!(wide.len(), general.len());
+            assert_eq!(bytes.len(), general.len());
+            for (&key, &id) in &general {
+                assert_eq!(wide.find(key), Some(id));
+                assert_eq!(narrow.find((key >> 64) as u64), Some(id));
+            }
+        }
+    }
+
+    #[test]
+    fn array_table_matches_the_hash_table() {
+        use veta_core::rand::Rng;
+        let mut rng = Rng::new(11);
+        // `Int32` keys packed in the low 32 bits; nullable ones with the flag at bit 32.
+        for nullable in [false, true] {
+            let null_bit = nullable.then_some(32);
+            let mut array = ArrayTable::new(-1000, 1000, 4, null_bit).unwrap();
+            let mut hash = FixedTable::<u64>::with_slots(2);
+            for _ in 0..50_000 {
+                let key = if nullable && rng.next_bool(0.05) {
+                    1u64 << 32
+                } else {
+                    rng.range_i64(-1000, 1000) as i32 as u32 as u64
+                };
+                assert_eq!(array.find_or_insert(key), Some(hash.find_or_insert(key)));
+            }
+            assert_eq!(array.len(), hash.len());
+            for (key, id) in array.entries() {
+                assert_eq!(hash.find(key), Some(id));
+            }
+            let converted = array.to_hash_table();
+            for (key, id) in array.entries() {
+                assert_eq!(converted.find(key), Some(id));
+            }
+            // A value outside the range leaves the table unchanged.
+            let before = array.len();
+            assert_eq!(array.find_or_insert(1001u32 as u64), None);
+            assert_eq!(array.find_or_insert((-1001i32) as u32 as u64), None);
+            assert_eq!(array.len(), before);
+        }
+        assert!(ArrayTable::new(0, MAX_ARRAY_SLOTS as i64, 8, None).is_none());
+        assert!(ArrayTable::new(i64::MIN, i64::MAX, 8, None).is_none());
+        let mut full = ArrayTable::new(i64::MAX - 3, i64::MAX, 8, None).unwrap();
+        assert_eq!(full.find_or_insert(i64::MAX as u64), Some(0));
+        assert_eq!(full.find_or_insert(i64::MIN as u64), None);
     }
 
     #[test]

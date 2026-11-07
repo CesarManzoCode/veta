@@ -12,6 +12,11 @@
 //! [`PARTITIONS`] radix partitions, built in parallel, each one a hash table from a key to
 //! its build rows in row order. A nested loop join (no key) keeps every right row.
 //!
+//! Every partition table is sized from the exact number of build rows it receives, twice as
+//! many slots as rows, so it never grows while filled; the build chunk is allocated once
+//! from the row and byte counts of the pieces. The probe hashes a string key straight from
+//! its vector, without copying the batch's strings.
+//!
 //! Probe: the candidates of a left row are the build rows with an equal key (every build
 //! row in a nested loop join; none when a left key is NULL). The pairs, at most
 //! [`CHUNK_ROWS`] at a time, are filtered by the residual; a pair that passes is a match:
@@ -371,6 +376,8 @@ fn emit_selected(
     emit(Batch {
         chunk: batch.chunk,
         selection: Some(selection),
+        dicts: batch.dicts,
+        origin: batch.origin,
     })
 }
 
@@ -550,7 +557,7 @@ pub(crate) fn build(
     }
 
     let mut build = if keep_columns {
-        Chunk::empty(&right_types)
+        presized_chunk(&right_types, &pieces, total)
     } else {
         Chunk::with_len(Vec::new(), 0)?
     };
@@ -606,6 +613,29 @@ pub(crate) fn build(
     })
 }
 
+/// An empty chunk of `types` with room for the `total` rows of `pieces` and their strings.
+fn presized_chunk(types: &[DataType], pieces: &[BuildPiece], total: usize) -> Chunk {
+    let columns = types
+        .iter()
+        .enumerate()
+        .map(|(c, &t)| {
+            let mut data = VectorData::with_capacity(t, total);
+            if let VectorData::Varchar { bytes, .. } = &mut data {
+                let strings: usize = pieces
+                    .iter()
+                    .map(|piece| match piece.chunk.columns.get(c).map(|v| &v.data) {
+                        Some(VectorData::Varchar { bytes, .. }) => bytes.len(),
+                        _ => 0,
+                    })
+                    .sum();
+                bytes.reserve(strings);
+            }
+            Vector::from_data(data)
+        })
+        .collect();
+    Chunk { columns, len: 0 }
+}
+
 impl JoinProbe {
     /// Whether no left row can produce output, so the left input need not be read.
     pub fn produces_nothing(&self) -> bool {
@@ -658,6 +688,25 @@ impl JoinProbe {
             .iter()
             .map(|e| e.vector(batch))
             .collect::<Result<Vec<_>>>()?;
+        if let (KeyLayout::Str, [v]) = (&self.layout, vectors.as_slice())
+            && v.validity.is_none()
+            && let VectorData::Varchar { offsets, bytes } = &v.data
+        {
+            let mut out = Vec::with_capacity(n);
+            for w in offsets.windows(2) {
+                let key = &bytes[w[0] as usize..w[1] as usize];
+                let hash = hash_bytes(key);
+                let partition = &self.partitions[partition_of(hash)];
+                let JoinTable::Bytes(table) = &partition.table else {
+                    return Err(mismatch());
+                };
+                out.push(Some(match table.find(key, hash) {
+                    Some(id) => partition.rows_of(id),
+                    None => &[][..],
+                }));
+            }
+            return Ok(out);
+        }
         let keys = encode_keys(&self.layout, vectors, n)?;
         let mut out = vec![None; n];
         for j in 0..keys.len() {
@@ -719,10 +768,7 @@ impl JoinProbe {
                             .iter()
                             .map(|&t| Vector::nulls(t, rows.len())),
                     );
-                    emit(Batch {
-                        chunk: Chunk::with_len(columns, rows.len())?,
-                        selection: None,
-                    })?;
+                    emit(Batch::new(Chunk::with_len(columns, rows.len())?))?;
                 }
                 Ok(())
             }
@@ -781,10 +827,7 @@ impl JoinProbe {
             };
             let mut columns = self.gather_left(batch, &left);
             columns.extend(self.build.columns.iter().map(|c| c.gather(&right)));
-            emit(Batch {
-                chunk: Chunk::with_len(columns, count)?,
-                selection: None,
-            })?;
+            emit(Batch::new(Chunk::with_len(columns, count)?))?;
         }
         pairs.left.clear();
         pairs.right.clear();
@@ -1052,6 +1095,37 @@ mod tests {
                 check(&left, &right, kind, keys, None);
                 check(&left, &right, kind, keys, Some((&residual, residual_check)));
             }
+        }
+    }
+
+    #[test]
+    fn string_keys_without_nulls_probe_straight_from_the_vector() {
+        // No NULL on the left: the probe hashes the strings of the batch in place.
+        let mut rng = Rng::new(43);
+        let left = random_rows(&mut rng, 700, 30, 0.0);
+        let right = random_rows(&mut rng, 300, 30, 0.1);
+        let (residual, residual_check) = not_equal_v();
+        for kind in [
+            JoinKind::Inner,
+            JoinKind::Left,
+            JoinKind::Semi,
+            JoinKind::Anti,
+            JoinKind::Single,
+        ] {
+            let right_rows: &[Vec<Value>] = if kind == JoinKind::Single {
+                // One right row per key, so that `Single` has no duplicate match.
+                &right[..1]
+            } else {
+                &right
+            };
+            check(&left, right_rows, kind, &[(1, 1)], None);
+            check(
+                &left,
+                right_rows,
+                kind,
+                &[(1, 1)],
+                Some((&residual, residual_check)),
+            );
         }
     }
 

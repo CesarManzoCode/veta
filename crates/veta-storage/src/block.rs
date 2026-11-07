@@ -20,7 +20,7 @@
 
 use std::borrow::Cow;
 
-use veta_codec::{Encoding, decode, encode, vlz};
+use veta_codec::{DictCodes, Encoding, decode_keeping_codes, encode, vlz};
 use veta_core::crc::{crc32c, crc32c_append};
 use veta_core::{Bitmap, DataType, Result, Vector, VetaError};
 
@@ -125,6 +125,20 @@ pub fn read_block(
     expected_rows: usize,
     part: &str,
 ) -> Result<(Vector, usize)> {
+    read_block_impl(bytes, data_type, nullable, expected_rows, part, false)
+        .map(|(vector, _, len)| (vector, len))
+}
+
+/// [`read_block`] that keeps `keep_codes` the dictionary and the codes of a `Dict` string
+/// block ([`decode_keeping_codes`]).
+fn read_block_impl(
+    bytes: &[u8],
+    data_type: DataType,
+    nullable: bool,
+    expected_rows: usize,
+    part: &str,
+    keep_codes: bool,
+) -> Result<(Vector, Option<DictCodes>, usize)> {
     let corrupt = |reason: String| VetaError::corrupt(part, reason);
     let header = BlockHeader::parse(bytes).map_err(corrupt)?;
     let len = header.block_len();
@@ -186,11 +200,12 @@ pub fn read_block(
     } else {
         (None, &raw[..])
     };
-    let decoded = decode(encoding, encoded, &data_type, rows)
+    let (decoded, codes) = decode_keeping_codes(encoding, encoded, &data_type, rows)
         .map_err(|e| corrupt(format!("{}: {}", encoding.name(), reason_of(&e))))?;
+    let codes = if keep_codes { codes } else { None };
     let validity = validity.filter(|b| !b.all_set());
     let vector = Vector::new(decoded.data, validity).map_err(|e| corrupt(reason_of(&e)))?;
-    Ok((vector, len))
+    Ok((vector, codes, len))
 }
 
 /// Reads a block that must fill `bytes` exactly (a granule delimited by its marks).
@@ -201,7 +216,22 @@ pub fn read_block_exact(
     expected_rows: usize,
     part: &str,
 ) -> Result<Vector> {
-    let (vector, len) = read_block(bytes, data_type, nullable, expected_rows, part)?;
+    read_block_exact_codes(bytes, data_type, nullable, expected_rows, part, false)
+        .map(|(vector, _)| vector)
+}
+
+/// [`read_block_exact`] that keeps `keep_codes` the dictionary and the codes of a `Dict`
+/// string block.
+pub fn read_block_exact_codes(
+    bytes: &[u8],
+    data_type: DataType,
+    nullable: bool,
+    expected_rows: usize,
+    part: &str,
+    keep_codes: bool,
+) -> Result<(Vector, Option<DictCodes>)> {
+    let (vector, codes, len) =
+        read_block_impl(bytes, data_type, nullable, expected_rows, part, keep_codes)?;
     if len != bytes.len() {
         return Err(VetaError::corrupt(
             part,
@@ -211,7 +241,7 @@ pub fn read_block_exact(
             ),
         ));
     }
-    Ok(vector)
+    Ok((vector, codes))
 }
 
 /// The reason of a codec error without the empty part name the codec puts in it.
@@ -403,5 +433,45 @@ mod tests {
             2,
             "p"
         )));
+    }
+
+    #[test]
+    fn reading_with_codes_gives_the_same_vector_and_the_dictionary() {
+        let mut rng = Rng::new(9);
+        // Long repeated strings in random order: `Dict` is the smallest encoding.
+        let words: Vec<String> = (0..20).map(|i| format!("{i}-{}", "x".repeat(40))).collect();
+        let values: Vec<Value> = (0..3000)
+            .map(|_| {
+                if rng.next_bool(0.1) {
+                    Value::Null
+                } else {
+                    Value::varchar(&words[rng.below(20) as usize])
+                }
+            })
+            .collect();
+        let vector = Vector::from_values(DataType::Varchar, &values).unwrap();
+        let bytes = block_bytes(&vector).unwrap();
+        let header = BlockHeader::parse(&bytes).unwrap();
+        assert_eq!(header.encoding, Encoding::Dict.id());
+        let plain = read_block_exact(&bytes, DataType::Varchar, true, 3000, "p").unwrap();
+        let (kept, codes) =
+            read_block_exact_codes(&bytes, DataType::Varchar, true, 3000, "p", true).unwrap();
+        assert_eq!(kept, plain);
+        assert_same(&kept, &vector);
+        let codes = codes.expect("a Dict block keeps its codes");
+        for i in 0..3000 {
+            if kept.is_valid(i) {
+                assert_eq!(codes.entries.get(codes.codes[i] as usize), kept.get(i));
+            }
+        }
+        let (_, none) =
+            read_block_exact_codes(&bytes, DataType::Varchar, true, 3000, "p", false).unwrap();
+        assert!(none.is_none());
+        // A corrupt block fails the same way with or without codes.
+        let mut bad = bytes.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0x55;
+        assert!(read_block_exact(&bad, DataType::Varchar, true, 3000, "p").is_err());
+        assert!(read_block_exact_codes(&bad, DataType::Varchar, true, 3000, "p", true).is_err());
     }
 }

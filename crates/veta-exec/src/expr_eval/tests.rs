@@ -981,3 +981,209 @@ fn selection_vectors_and_borrowed_columns() {
             .is_err()
     );
 }
+
+fn like_expr(e: BoundExpr, pattern: &str, negated: bool) -> BoundExpr {
+    BoundExpr::new(
+        BoundExprKind::Like {
+            expr: Box::new(e),
+            pattern: Box::new(lit(s(pattern))),
+            negated,
+        },
+        DataType::Boolean,
+        true,
+    )
+}
+
+fn is_null_expr(e: BoundExpr, negated: bool) -> BoundExpr {
+    BoundExpr::new(
+        BoundExprKind::IsNull {
+            expr: Box::new(e),
+            negated,
+        },
+        DataType::Boolean,
+        false,
+    )
+}
+
+/// Int32, Varchar (few distinct values) and Float64 columns, all with NULLs.
+fn random_filter_chunk(seed: u64, rows: usize) -> Chunk {
+    let mut rng = veta_core::rand::Rng::new(seed);
+    let mut ints = Vec::new();
+    let mut strs = Vec::new();
+    let mut floats = Vec::new();
+    for _ in 0..rows {
+        ints.push(if rng.next_bool(0.1) {
+            Value::Null
+        } else {
+            Value::Int32(rng.range_i64(-5, 5) as i32)
+        });
+        strs.push(if rng.next_bool(0.1) {
+            Value::Null
+        } else {
+            let words = ["", "google", "a google b", "go", "xgoo", "gle", "yandex"];
+            s(words[rng.below(words.len() as u64) as usize])
+        });
+        floats.push(if rng.next_bool(0.1) {
+            Value::Null
+        } else {
+            Value::Float64(rng.range_i64(-3, 3) as f64 / 2.0)
+        });
+    }
+    chunk(vec![
+        (DataType::Int32, ints),
+        (DataType::Varchar, strs),
+        (DataType::Float64, floats),
+    ])
+}
+
+/// Predicates of every shape the in-place leaf path takes.
+fn leaf_predicates() -> Vec<BoundExpr> {
+    let ops = [
+        BinaryOp::Eq,
+        BinaryOp::NotEq,
+        BinaryOp::Lt,
+        BinaryOp::LtEq,
+        BinaryOp::Gt,
+        BinaryOp::GtEq,
+    ];
+    let mut out = Vec::new();
+    for op in ops {
+        let b = DataType::Boolean;
+        out.push(bin(op, col(0, DataType::Int32), lit(Value::Int32(1)), b));
+        out.push(bin(op, lit(Value::Int32(-2)), col(0, DataType::Int32), b));
+        out.push(bin(op, col(1, DataType::Varchar), lit(s("go")), b));
+        out.push(bin(op, lit(s("")), col(1, DataType::Varchar), b));
+        out.push(bin(
+            op,
+            col(2, DataType::Float64),
+            lit(Value::Float64(0.5)),
+            b,
+        ));
+    }
+    for pattern in [
+        "%google%", "go%", "%gle", "google", "%o_g%", "%", "", "%a%b%",
+    ] {
+        for negated in [false, true] {
+            out.push(like_expr(col(1, DataType::Varchar), pattern, negated));
+        }
+    }
+    for negated in [false, true] {
+        out.push(is_null_expr(col(0, DataType::Int32), negated));
+        out.push(is_null_expr(col(1, DataType::Varchar), negated));
+    }
+    out
+}
+
+#[test]
+fn in_place_leaves_match_the_general_path() {
+    let mut rng = veta_core::rand::Rng::new(5);
+    for seed in 0..20 {
+        let c = random_filter_chunk(seed, 300);
+        let selection: Vec<u32> = (0..300u32).filter(|_| rng.next_bool(0.4)).collect();
+        for predicate in leaf_predicates() {
+            let compiled = CompiledExpr::new(&predicate).unwrap();
+            for sel in [None, Some(selection.as_slice())] {
+                assert_eq!(
+                    compiled.eval_predicate(&c, sel).unwrap(),
+                    compiled.select_general(&c, sel).unwrap(),
+                    "{} with selection {}",
+                    predicate.to_sql(),
+                    sel.is_some()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn dictionary_filter_matches_the_filter_over_values() {
+    use veta_codec::{Encoding, decode_keeping_codes, encode_with};
+    let mut rng = veta_core::rand::Rng::new(8);
+    for seed in 0..20 {
+        let c = random_filter_chunk(100 + seed, 500);
+        let strings = c.column(1);
+        let bytes = encode_with(strings, Encoding::Dict).unwrap();
+        let (_, codes) =
+            decode_keeping_codes(Encoding::Dict, &bytes, &DataType::Varchar, c.len).unwrap();
+        let codes = codes.expect("a Dict block keeps its codes");
+        let dicts = vec![None, Some(Arc::new(codes)), None];
+        let selection: Vec<u32> = (0..500u32).filter(|_| rng.next_bool(0.5)).collect();
+        for predicate in leaf_predicates() {
+            let compiled = CompiledExpr::new(&predicate).unwrap();
+            for sel in [None, Some(selection.as_slice())] {
+                assert_eq!(
+                    compiled.eval_predicate_with_dicts(&c, &dicts, sel).unwrap(),
+                    compiled.select_general(&c, sel).unwrap(),
+                    "{} with selection {}",
+                    predicate.to_sql(),
+                    sel.is_some()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn infallible_conjuncts_go_cheapest_first() {
+    let b = DataType::Boolean;
+    let expensive = like_expr(col(1, DataType::Varchar), "%google%", false);
+    let cheap = bin(
+        BinaryOp::Eq,
+        col(0, DataType::Int32),
+        lit(Value::Int32(1)),
+        b,
+    );
+    let both = bin(BinaryOp::And, expensive.clone(), cheap.clone(), b);
+    let compiled = CompiledExpr::new(&both).unwrap();
+    let Node::Binary { left, right, .. } = &compiled.root.node else {
+        panic!("not a conjunction");
+    };
+    assert!(matches!(left.node, Node::Binary { .. }), "cheap side first");
+    assert!(matches!(right.node, Node::Like { .. }));
+
+    // A conjunct that can fail keeps the query order.
+    let fallible = bin(
+        BinaryOp::Gt,
+        bin(
+            BinaryOp::Add,
+            col(0, DataType::Int32),
+            lit(Value::Int32(1)),
+            DataType::Int32,
+        ),
+        lit(Value::Int32(0)),
+        b,
+    );
+    let mixed = bin(
+        BinaryOp::And,
+        bin(BinaryOp::And, expensive.clone(), fallible.clone(), b),
+        cheap.clone(),
+        b,
+    );
+    let compiled_mixed = CompiledExpr::new(&mixed).unwrap();
+    let Node::Binary { left, .. } = &compiled_mixed.root.node else {
+        panic!("not a conjunction");
+    };
+    let Node::Binary { left: first, .. } = &left.node else {
+        panic!("not a left-deep conjunction");
+    };
+    assert!(matches!(first.node, Node::Like { .. }), "query order kept");
+
+    // Either order selects the same rows.
+    for seed in 0..10 {
+        let c = random_filter_chunk(200 + seed, 200);
+        let reversed = bin(BinaryOp::And, cheap.clone(), expensive.clone(), b);
+        assert_eq!(
+            compiled.eval_predicate(&c, None).unwrap(),
+            CompiledExpr::new(&reversed)
+                .unwrap()
+                .eval_predicate(&c, None)
+                .unwrap()
+        );
+        let rows = compiled_mixed.eval_predicate(&c, None).unwrap();
+        let values = run(&mixed, &c);
+        let expected: Vec<u32> = (0..c.len as u32)
+            .filter(|&r| values[r as usize] == Value::Boolean(true))
+            .collect();
+        assert_eq!(rows, expected);
+    }
+}

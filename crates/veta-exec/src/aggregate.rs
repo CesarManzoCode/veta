@@ -7,6 +7,12 @@
 //! of every table are split by the top bits of their hash and each partition is merged on
 //! its own into a new table.
 //!
+//! Two thread-local shortcuts give the same ids as the table they replace: a single integer
+//! key whose range the part statistics bound is grouped by array ([`ArrayTable`], turned into
+//! a hash table if a value falls outside), and a string key from a `Dict`-encoded block is
+//! looked up once per dictionary entry, its group then picked by code for every row. The
+//! hash of a string key is computed once per key and kept in the table for the radix split.
+//!
 //! `COUNT(DISTINCT)` keeps `(group id, value)` pairs in 64 hash sets per worker, split by the
 //! hash of the value. Once the groups are merged, the same set of every worker is combined
 //! with the thread-local ids translated to global ones, and each new pair counts for its
@@ -19,7 +25,7 @@ use veta_core::hash::{hash_bytes, hash_u64, hash_u128};
 use veta_core::memory::Reservation;
 use veta_core::types::MAX_DECIMAL64_PRECISION;
 use veta_core::value::cmp_f64;
-use veta_core::{Bitmap, Chunk, DataType, Result, Vector, VectorData, VetaError, decimal};
+use veta_core::{Bitmap, Chunk, DataType, Result, Value, Vector, VectorData, VetaError, decimal};
 use veta_sql::{AggFunc, AggregateExpr, BoundExpr};
 
 use crate::context::{ExecContext, new_reservation};
@@ -27,7 +33,7 @@ use crate::group_keys::{
     FixedColumn, KeyBuf, KeyLayout, canonical_bits, decode_composite, decode_strings, pack_keys,
     serialize_keys, unpack_column,
 };
-use crate::hash_table::{BytesTable, FixedKey, FixedTable, PARTITIONS, partition_of};
+use crate::hash_table::{ArrayTable, BytesTable, FixedKey, FixedTable, PARTITIONS, partition_of};
 use crate::pipeline::{
     Batch, CHUNK_ROWS, Evaluator, Materialized, Pipeline, chunk_bytes, parallel_tasks,
 };
@@ -849,15 +855,28 @@ impl DistinctSets {
 }
 
 /// Maps keys to group ids; [`GroupTable::Global`] has one group, always present.
+/// [`GroupTable::Array`] only appears in the workers, for a `Fixed64` layout.
 #[derive(Debug)]
 enum GroupTable {
     Global,
     Fixed64(FixedTable<u64>),
     Fixed128(FixedTable<u128>),
     Bytes(BytesTable),
+    Array(ArrayTable),
 }
 
 impl GroupTable {
+    /// The table of a worker: by array when the plan has a key range, else by hash.
+    fn for_worker(plan: &AggPlan) -> GroupTable {
+        if let (Some((min, max)), KeyLayout::Fixed64(columns)) = (plan.array_range, &plan.layout)
+            && let [column] = columns.as_slice()
+            && let Some(table) = ArrayTable::new(min, max, column.width, column.null_shift)
+        {
+            return GroupTable::Array(table);
+        }
+        GroupTable::new(&plan.layout)
+    }
+
     fn new(layout: &KeyLayout) -> GroupTable {
         match layout {
             KeyLayout::Global => GroupTable::Global,
@@ -875,6 +894,7 @@ impl GroupTable {
             GroupTable::Fixed64(t) => t.len(),
             GroupTable::Fixed128(t) => t.len(),
             GroupTable::Bytes(t) => t.len(),
+            GroupTable::Array(t) => t.len(),
         }
     }
 
@@ -884,8 +904,43 @@ impl GroupTable {
             GroupTable::Fixed64(t) => t.bytes(),
             GroupTable::Fixed128(t) => t.bytes(),
             GroupTable::Bytes(t) => t.bytes(),
+            GroupTable::Array(t) => t.bytes(),
         }
     }
+}
+
+/// A statistics bound of an integer key as `i64`.
+fn bound_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int16(v) => Some(*v as i64),
+        Value::Int32(v) | Value::Date(v) => Some(*v as i64),
+        Value::Int64(v) | Value::Timestamp(v) => Some(*v),
+        Value::Decimal { value, .. } => i64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+/// The range of the only group column when it is an integer read unchanged from a stored
+/// table whose part statistics bound it.
+fn array_range(plan: &AggPlan, pipeline: &Pipeline) -> Option<(i64, i64)> {
+    let KeyLayout::Fixed64(columns) = &plan.layout else {
+        return None;
+    };
+    let [column] = columns.as_slice() else {
+        return None;
+    };
+    let integer = match column.data_type {
+        DataType::Int16 | DataType::Int32 | DataType::Int64 => true,
+        DataType::Date | DataType::Timestamp => true,
+        DataType::Decimal { precision, .. } => precision <= MAX_DECIMAL64_PRECISION,
+        _ => false,
+    };
+    if !integer {
+        return None;
+    }
+    let source = plan.groups.first()?.plain_column()?;
+    let (min, max) = pipeline.column_range(source)?;
+    Some((bound_i64(&min)?, bound_i64(&max)?))
 }
 
 /// One aggregate of the query.
@@ -907,6 +962,8 @@ struct AggPlan {
     layout: KeyLayout,
     aggregates: Vec<AggSpec>,
     distinct_count: usize,
+    /// Bounds of a single integer key: the workers group by array.
+    array_range: Option<(i64, i64)>,
 }
 
 impl AggPlan {
@@ -939,6 +996,7 @@ impl AggPlan {
             layout: KeyLayout::new(&columns),
             aggregates: specs,
             distinct_count,
+            array_range: None,
         })
     }
 
@@ -970,6 +1028,8 @@ struct ThreadAgg {
     keys128: Vec<u128>,
     key_buf: KeyBuf,
     scratch: Vec<u8>,
+    /// Group of each dictionary entry of the current batch (`u32::MAX`: not looked up).
+    code_gids: Vec<u32>,
     mem: Reservation<'static>,
 }
 
@@ -984,7 +1044,7 @@ impl ThreadAgg {
             }
         }
         Ok(ThreadAgg {
-            table: GroupTable::new(&plan.layout),
+            table: GroupTable::for_worker(plan),
             states: plan.new_states(groups)?,
             distinct,
             groups,
@@ -993,20 +1053,86 @@ impl ThreadAgg {
             keys128: Vec::new(),
             key_buf: KeyBuf::default(),
             scratch: Vec::new(),
+            code_gids: Vec::new(),
             mem: new_reservation()?,
         })
     }
 
+    /// Groups a batch by the codes of its `Dict`-encoded string key: each entry is looked up
+    /// once, in the order its first row comes, so the ids are those of a lookup per row.
+    /// `false` if the key is not such a column (or may hold a NULL), and nothing was done.
+    fn group_by_codes(&mut self, plan: &AggPlan, batch: &Batch) -> Result<bool> {
+        let (GroupTable::Bytes(table), KeyLayout::Str) = (&mut self.table, &plan.layout) else {
+            return Ok(false);
+        };
+        let Some(column) = plan.groups.first().and_then(Evaluator::plain_column) else {
+            return Ok(false);
+        };
+        let Some(dict) = batch.dict(column) else {
+            return Ok(false);
+        };
+        let VectorData::Varchar { offsets, bytes } = &dict.entries.data else {
+            return Ok(false);
+        };
+        let vector = &batch.chunk.columns[column];
+        if vector.validity.is_some() || dict.codes.len() != batch.chunk.len {
+            return Ok(false);
+        }
+        self.code_gids.clear();
+        self.code_gids.resize(offsets.len() - 1, u32::MAX);
+        let mut group = |row: usize| {
+            let code = dict.codes[row] as usize;
+            let mut gid = self.code_gids[code];
+            if gid == u32::MAX {
+                let key = &bytes[offsets[code] as usize..offsets[code + 1] as usize];
+                gid = table.find_or_insert(key, hash_bytes(key));
+                self.code_gids[code] = gid;
+            }
+            gid
+        };
+        match &batch.selection {
+            None => self.gids.extend((0..batch.chunk.len).map(&mut group)),
+            Some(rows) => self.gids.extend(rows.iter().map(|&r| group(r as usize))),
+        }
+        Ok(true)
+    }
+
     fn consume(&mut self, plan: &AggPlan, batch: &Batch) -> Result<()> {
+        self.gids.clear();
+        if !self.group_by_codes(plan, batch)? {
+            self.group_by_keys(plan, batch)?;
+        }
+        self.update_states(plan, batch)
+    }
+
+    /// The group id of every selected row of `batch`, into `self.gids`.
+    fn group_by_keys(&mut self, plan: &AggPlan, batch: &Batch) -> Result<()> {
         let n = batch.rows();
         let vectors = plan
             .groups
             .iter()
             .map(|g| g.vector(batch))
             .collect::<Result<Vec<_>>>()?;
-        self.gids.clear();
+        let mut overflowed = None;
         match (&mut self.table, &plan.layout) {
             (GroupTable::Global, KeyLayout::Global) => self.gids.resize(n, 0),
+            (GroupTable::Array(table), KeyLayout::Fixed64(columns)) => {
+                pack_keys(columns, &vectors, n, &mut self.keys64)?;
+                for (i, &key) in self.keys64.iter().enumerate() {
+                    match table.find_or_insert(key) {
+                        Some(id) => self.gids.push(id),
+                        None => {
+                            // A value outside the statistics: the same ids go on in a hash
+                            // table, which takes the rest of the batch and what follows.
+                            let mut hash = table.to_hash_table();
+                            self.gids
+                                .extend(self.keys64[i..].iter().map(|&k| hash.find_or_insert(k)));
+                            overflowed = Some(hash);
+                            break;
+                        }
+                    }
+                }
+            }
             (GroupTable::Fixed64(table), KeyLayout::Fixed64(columns)) => {
                 pack_keys(columns, &vectors, n, &mut self.keys64)?;
                 self.gids
@@ -1039,6 +1165,15 @@ impl ThreadAgg {
             }
             _ => return Err(VetaError::internal("group table does not match its layout")),
         }
+        if let Some(hash) = overflowed {
+            self.table = GroupTable::Fixed64(hash);
+        }
+        Ok(())
+    }
+
+    /// Updates the aggregate states with the rows of `batch`, whose groups are in
+    /// `self.gids`.
+    fn update_states(&mut self, plan: &AggPlan, batch: &Batch) -> Result<()> {
         let groups = self.table.len();
         if groups > self.groups {
             for state in &mut self.states {
@@ -1067,6 +1202,7 @@ impl ThreadAgg {
             + self.states.iter().map(AggState::bytes).sum::<u64>()
             + self.distinct.iter().map(DistinctSets::bytes).sum::<u64>()
             + self.gids.capacity() as u64 * 4
+            + self.code_gids.capacity() as u64 * 4
     }
 }
 
@@ -1092,6 +1228,13 @@ fn partition_groups(table: &GroupTable) -> PartitionLists {
     match table {
         GroupTable::Global => PartitionLists::Global,
         GroupTable::Fixed64(t) => PartitionLists::Fixed64(fixed_lists(t)),
+        GroupTable::Array(t) => {
+            let mut lists = vec![Vec::new(); PARTITIONS];
+            for (key, id) in t.entries() {
+                lists[partition_of(key.hash64())].push((key, id));
+            }
+            PartitionLists::Fixed64(lists)
+        }
         GroupTable::Fixed128(t) => PartitionLists::Fixed128(fixed_lists(t)),
         GroupTable::Bytes(t) => {
             let mut lists = vec![Vec::new(); PARTITIONS];
@@ -1324,7 +1467,13 @@ pub(crate) fn run(
     aggregates: &[AggregateExpr],
     ctx: &ExecContext<'_>,
 ) -> Result<Materialized> {
-    let plan = AggPlan::new(groups, aggregates)?;
+    let mut plan = AggPlan::new(groups, aggregates)?;
+    plan.array_range = array_range(&plan, &pipeline);
+    run_plan(pipeline, plan, ctx)
+}
+
+/// [`run`] with a plan whose key range is already decided.
+fn run_plan(pipeline: Pipeline, plan: AggPlan, ctx: &ExecContext<'_>) -> Result<Materialized> {
     let threads = pipeline.run_workers(
         ctx,
         || ThreadAgg::new(&plan),
@@ -1678,6 +1827,120 @@ mod tests {
         )];
         let err = AggPlan::new(&[], &aggregates).unwrap_err();
         assert_eq!(err.to_string(), "unsupported: SUM(DISTINCT)");
+    }
+
+    fn run_plan_on(chunks: Vec<Chunk>, plan: AggPlan, threads: usize) -> Vec<Vec<Value>> {
+        let db = Database::open("unused");
+        let stats = ExecStats::default();
+        let ctx = ExecContext {
+            db: &db,
+            threads,
+            stats: &stats,
+            prune: true,
+            profile: None,
+        };
+        let out = run_plan(Pipeline::new(Source::chunks(chunks)), plan, &ctx).unwrap();
+        let mut rows = rows_of(&out.chunks);
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn aggregation_by_array_matches_aggregation_by_hash() {
+        let mut rng = Rng::new(31);
+        for nullable in [false, true] {
+            let chunks: Vec<Chunk> = (0..30)
+                .map(|_| {
+                    let rows: Vec<Vec<Value>> = (0..400)
+                        .map(|_| {
+                            let key = if nullable && rng.next_bool(0.1) {
+                                Value::Null
+                            } else {
+                                Value::Int32(rng.range_i64(-300, 300) as i32)
+                            };
+                            vec![key, Value::Int64(rng.range_i64(-1000, 1000))]
+                        })
+                        .collect();
+                    Chunk::from_rows(&[DataType::Int32, DataType::Int64], &rows).unwrap()
+                })
+                .collect();
+            let groups = [col(0, DataType::Int32, nullable)];
+            let aggregates = [
+                agg(AggFunc::CountStar, false, None),
+                agg(AggFunc::Sum, false, Some(col(1, DataType::Int64, false))),
+                agg(AggFunc::Min, false, Some(col(1, DataType::Int64, false))),
+                agg(AggFunc::Count, true, Some(col(1, DataType::Int64, false))),
+            ];
+            let by_hash = AggPlan::new(&groups, &aggregates).unwrap();
+            assert!(by_hash.array_range.is_none());
+            let expected = run_plan_on(chunks.clone(), by_hash, 1);
+            // The exact range, a wider one and one that some values fall outside of, which
+            // turns the array into a hash table in the middle of a batch.
+            for range in [(-300, 300), (-5000, 70_000), (-10, 10)] {
+                for threads in [1, 4] {
+                    let mut by_array = AggPlan::new(&groups, &aggregates).unwrap();
+                    by_array.array_range = Some(range);
+                    assert_eq!(
+                        run_plan_on(chunks.clone(), by_array, threads),
+                        expected,
+                        "range {range:?}, threads {threads}, nullable {nullable}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grouping_by_codes_matches_grouping_by_values() {
+        use std::sync::Arc;
+        use veta_codec::{Encoding, decode_keeping_codes, encode_with};
+        let plan = AggPlan::new(
+            &[col(0, DataType::Varchar, false)],
+            &[agg(AggFunc::CountStar, false, None)],
+        )
+        .unwrap();
+        let mut by_codes = ThreadAgg::new(&plan).unwrap();
+        let mut by_values = ThreadAgg::new(&plan).unwrap();
+        let mut rng = Rng::new(21);
+        for round in 0..30 {
+            let values: Vec<Value> = (0..700)
+                .map(|_| Value::varchar(format!("k{}", rng.below(60 + round))))
+                .collect();
+            let vector = Vector::from_values(DataType::Varchar, &values).unwrap();
+            let bytes = encode_with(&vector, Encoding::Dict).unwrap();
+            let (_, codes) =
+                decode_keeping_codes(Encoding::Dict, &bytes, &DataType::Varchar, 700).unwrap();
+            let selection: Option<Vec<u32>> =
+                (round % 2 == 1).then(|| (0..700u32).filter(|_| rng.next_bool(0.3)).collect());
+            let plain = Batch {
+                chunk: Chunk::new(vec![vector]).unwrap(),
+                selection,
+                dicts: Vec::new(),
+                origin: None,
+            };
+            let coded = Batch {
+                chunk: plain.chunk.clone(),
+                selection: plain.selection.clone(),
+                dicts: vec![codes.map(Arc::new)],
+                origin: None,
+            };
+            by_codes.gids.clear();
+            assert!(by_codes.group_by_codes(&plan, &coded).unwrap());
+            by_values.gids.clear();
+            assert!(!by_values.group_by_codes(&plan, &plain).unwrap());
+            by_values.group_by_keys(&plan, &plain).unwrap();
+            assert_eq!(by_codes.gids, by_values.gids, "round {round}");
+            by_codes.update_states(&plan, &coded).unwrap();
+            by_values.update_states(&plan, &plain).unwrap();
+        }
+        let (GroupTable::Bytes(a), GroupTable::Bytes(b)) = (&by_codes.table, &by_values.table)
+        else {
+            panic!("string keys use a bytes table");
+        };
+        assert_eq!(a.len(), b.len());
+        for id in 0..a.len() {
+            assert_eq!(a.key(id), b.key(id));
+        }
     }
 
     #[test]

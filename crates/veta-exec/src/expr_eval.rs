@@ -9,12 +9,20 @@
 //! materialized (column-literal fast paths). Logic is three-valued; integer overflow and
 //! decimal overflow are errors (exit 1) on non-NULL rows; `/` and `%` by zero give NULL
 //! (the binder types both as nullable).
+//!
+//! Predicates: a conjunction whose conjuncts can never fail is evaluated cheapest first
+//! (the order changes neither the rows nor the errors, since none can fail). A leaf that
+//! compares a column with a constant, tests it for NULL or matches it with a constant `LIKE`
+//! runs on the selected rows in place, without gathering the column; on a `Dict`-encoded
+//! string block it is evaluated once per dictionary entry and the codes pick the rows.
 
 mod cast;
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::sync::Arc;
 
+use veta_codec::DictCodes;
 use veta_core::datetime::{DatePart, TruncUnit};
 use veta_core::types::MAX_DECIMAL64_PRECISION;
 use veta_core::value::{cmp_f64, cmp_scaled};
@@ -119,6 +127,9 @@ fn compile(e: &BoundExpr) -> Result<Expr> {
             UnaryOp::Neg => Node::Neg(boxed(expr)?),
             UnaryOp::Not => Node::Not(boxed(expr)?),
         },
+        BoundExprKind::Binary {
+            op: BinaryOp::And, ..
+        } => return compile_conjunction(e),
         BoundExprKind::Binary { op, left, right } => Node::Binary {
             op: *op,
             left: boxed(left)?,
@@ -206,6 +217,256 @@ fn compile(e: &BoundExpr) -> Result<Expr> {
     Ok(Expr {
         node,
         ty: e.data_type,
+    })
+}
+
+/// The conjuncts of a chain of `AND`s, left to right.
+fn conjuncts<'e>(e: &'e BoundExpr, out: &mut Vec<&'e BoundExpr>) {
+    match &e.kind {
+        BoundExprKind::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            conjuncts(left, out);
+            conjuncts(right, out);
+        }
+        _ => out.push(e),
+    }
+}
+
+/// A chain of `AND`s as a left-deep tree. When no conjunct can fail, they go cheapest first
+/// (stable, so equal costs keep the query order): the right side of an `AND` only sees the
+/// rows its left side kept, and with infallible conjuncts the order changes neither the
+/// result nor the errors. Otherwise the query order stays.
+fn compile_conjunction(e: &BoundExpr) -> Result<Expr> {
+    let mut parts = Vec::new();
+    conjuncts(e, &mut parts);
+    let mut compiled = parts
+        .into_iter()
+        .map(compile)
+        .collect::<Result<Vec<Expr>>>()?;
+    if compiled.iter().all(infallible) {
+        compiled.sort_by_key(cost);
+    }
+    let mut items = compiled.into_iter();
+    let mut tree = items
+        .next()
+        .ok_or_else(|| VetaError::internal("empty conjunction"))?;
+    for next in items {
+        tree = Expr {
+            node: Node::Binary {
+                op: BinaryOp::And,
+                left: Box::new(tree),
+                right: Box::new(next),
+            },
+            ty: DataType::Boolean,
+        };
+    }
+    Ok(tree)
+}
+
+fn is_comparison(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+    )
+}
+
+/// Whether evaluating `e` can never fail, whatever the rows: columns, constants,
+/// comparisons, `IS NULL`, constant `LIKE`, `IN` lists and the logic between them.
+fn infallible(e: &Expr) -> bool {
+    match &e.node {
+        Node::Column(_) | Node::Literal(_) => true,
+        Node::Not(inner) => infallible(inner),
+        Node::IsNull { expr, .. } => infallible(expr),
+        Node::Like {
+            expr,
+            pattern: LikeArg::Const(_),
+            ..
+        } => infallible(expr),
+        Node::Binary { op, left, right } => {
+            (matches!(op, BinaryOp::And | BinaryOp::Or) || is_comparison(*op))
+                && infallible(left)
+                && infallible(right)
+        }
+        Node::InList { expr, list, .. } => infallible(expr) && list.iter().all(infallible),
+        _ => false,
+    }
+}
+
+/// Relative cost of evaluating `e` per row, to order the conjuncts of a filter: fixed-width
+/// comparisons first (equality before ranges), then strings, then `LIKE` by pattern shape.
+fn cost(e: &Expr) -> u32 {
+    let compare = |ty: DataType| match ty {
+        DataType::Varchar => 8,
+        DataType::Int128 | DataType::Decimal { .. } => 3,
+        _ => 2,
+    };
+    match &e.node {
+        Node::Column(_) | Node::Literal(_) => 0,
+        Node::Not(inner) => cost(inner),
+        Node::IsNull { expr, .. } => 1 + cost(expr),
+        Node::Like { expr, pattern, .. } => {
+            let pattern = match pattern {
+                LikeArg::Const(Some(p)) => p.cost(),
+                LikeArg::Const(None) => 0,
+                LikeArg::Dynamic(p) => 64 + cost(p),
+            };
+            pattern + cost(expr)
+        }
+        Node::Binary { op, left, right } if is_comparison(*op) => {
+            compare(left.ty) + u32::from(*op != BinaryOp::Eq) + cost(left) + cost(right)
+        }
+        Node::Binary { left, right, .. } => cost(left) + cost(right) + 1,
+        Node::InList { expr, list, .. } => {
+            cost(expr) + list.iter().map(|i| compare(i.ty) + cost(i)).sum::<u32>()
+        }
+        _ => 100,
+    }
+}
+
+/// Every column `e` reads, possibly repeated.
+fn visit_columns(e: &Expr, out: &mut Vec<usize>) {
+    match &e.node {
+        Node::Column(i) => out.push(*i),
+        Node::Literal(_) => {}
+        Node::Neg(x)
+        | Node::Not(x)
+        | Node::Cast(x)
+        | Node::Length(x)
+        | Node::Extract(_, x)
+        | Node::DateTrunc(_, x) => visit_columns(x, out),
+        Node::Binary { left, right, .. } => {
+            visit_columns(left, out);
+            visit_columns(right, out);
+        }
+        Node::Case { branches, else_ } => {
+            for (c, v) in branches {
+                visit_columns(c, out);
+                visit_columns(v, out);
+            }
+            if let Some(x) = else_ {
+                visit_columns(x, out);
+            }
+        }
+        Node::Like { expr, pattern, .. } => {
+            visit_columns(expr, out);
+            if let LikeArg::Dynamic(p) = pattern {
+                visit_columns(p, out);
+            }
+        }
+        Node::InList { expr, list, .. } => {
+            visit_columns(expr, out);
+            list.iter().for_each(|i| visit_columns(i, out));
+        }
+        Node::IsNull { expr, .. } => visit_columns(expr, out),
+        Node::Substring(args) | Node::RegexpReplace { args, .. } => {
+            args.iter().for_each(|a| visit_columns(a, out))
+        }
+    }
+}
+
+/// The chunk rows among `sel` (all `n` rows without it), in order, for which `keep` holds.
+#[inline]
+fn filter_rows(n: usize, sel: Option<&[u32]>, mut keep: impl FnMut(usize) -> bool) -> Vec<u32> {
+    match sel {
+        None => (0..n as u32).filter(|&r| keep(r as usize)).collect(),
+        Some(s) => s.iter().copied().filter(|&r| keep(r as usize)).collect(),
+    }
+}
+
+/// `op` with its operands swapped (`c < x` is `x > c`).
+fn flipped(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
+}
+
+/// Whether `order` (of the left operand against the right) satisfies comparison `op`.
+#[inline]
+fn satisfies(op: BinaryOp, order: Ordering) -> bool {
+    match op {
+        BinaryOp::Eq => order == Ordering::Equal,
+        BinaryOp::NotEq => order != Ordering::Equal,
+        BinaryOp::Lt => order == Ordering::Less,
+        BinaryOp::LtEq => order != Ordering::Greater,
+        BinaryOp::Gt => order == Ordering::Greater,
+        _ => order != Ordering::Less,
+    }
+}
+
+/// Rows of a fixed-width column whose value compares with `c` as `op` asks; NULL rows never.
+fn compare_rows<T: Copy>(
+    values: &[T],
+    validity: Option<&Bitmap>,
+    c: T,
+    op: BinaryOp,
+    sel: Option<&[u32]>,
+    cmp: impl Fn(T, T) -> Ordering,
+) -> Vec<u32> {
+    let n = values.len();
+    // The comparison is chosen outside the loop, so each loop is a plain scan.
+    macro_rules! scan {
+        ($test:expr) => {{
+            let test = $test;
+            match validity {
+                None => filter_rows(n, sel, |r| test(values[r])),
+                Some(valid) => filter_rows(n, sel, |r| valid.get(r) && test(values[r])),
+            }
+        }};
+    }
+    match op {
+        BinaryOp::Eq => scan!(|x: T| cmp(x, c) == Ordering::Equal),
+        BinaryOp::NotEq => scan!(|x: T| cmp(x, c) != Ordering::Equal),
+        BinaryOp::Lt => scan!(|x: T| cmp(x, c) == Ordering::Less),
+        BinaryOp::LtEq => scan!(|x: T| cmp(x, c) != Ordering::Greater),
+        BinaryOp::Gt => scan!(|x: T| cmp(x, c) == Ordering::Greater),
+        _ => scan!(|x: T| cmp(x, c) != Ordering::Less),
+    }
+}
+
+/// Rows of a string column for which `test` holds, NULL rows never. With the codes of a
+/// `Dict` block, `test` runs once per dictionary entry.
+fn string_rows(
+    v: &Vector,
+    dict: Option<&DictCodes>,
+    sel: Option<&[u32]>,
+    entry_hits: impl Fn(&[u32], &[u8]) -> Vec<bool>,
+    test: impl Fn(&[u8]) -> bool,
+) -> Result<Vec<u32>> {
+    let VectorData::Varchar { offsets, bytes } = &v.data else {
+        return Err(mismatch("string predicate"));
+    };
+    let n = v.len();
+    let valid = |r: usize| v.is_valid(r);
+    if let Some(dict) = dict
+        && let VectorData::Varchar {
+            offsets: dict_offsets,
+            bytes: dict_bytes,
+        } = &dict.entries.data
+        && dict.codes.len() == n
+    {
+        let hits = entry_hits(dict_offsets, dict_bytes);
+        let codes = &dict.codes;
+        return Ok(match &v.validity {
+            None => filter_rows(n, sel, |r| hits[codes[r] as usize]),
+            Some(_) => filter_rows(n, sel, |r| valid(r) && hits[codes[r] as usize]),
+        });
+    }
+    let at = |r: usize| &bytes[offsets[r] as usize..offsets[r + 1] as usize];
+    Ok(match &v.validity {
+        None => filter_rows(n, sel, |r| test(at(r))),
+        Some(_) => filter_rows(n, sel, |r| valid(r) && test(at(r))),
     })
 }
 
@@ -1069,6 +1330,15 @@ impl CompiledExpr {
         self.root.ty
     }
 
+    /// The columns the expression reads, sorted, each once.
+    pub fn columns(&self) -> Vec<usize> {
+        let mut columns = Vec::new();
+        visit_columns(&self.root, &mut columns);
+        columns.sort_unstable();
+        columns.dedup();
+        columns
+    }
+
     /// Evaluates over the selected rows of `chunk`; one output row per selected row.
     pub fn eval(&self, chunk: &Chunk, selection: Option<&[u32]>) -> Result<Vector> {
         let n = selection.map_or(chunk.len, <[u32]>::len);
@@ -1079,24 +1349,159 @@ impl CompiledExpr {
     /// Chunk rows (among `selection`, keeping its order) where the predicate is true.
     /// `AND` and `OR` short-circuit: the right side only sees the rows still undecided.
     pub fn eval_predicate(&self, chunk: &Chunk, selection: Option<&[u32]>) -> Result<Vec<u32>> {
+        self.eval_predicate_with_dicts(chunk, &[], selection)
+    }
+
+    /// [`CompiledExpr::eval_predicate`] with the dictionary codes of the `Dict`-encoded
+    /// string columns of `chunk` (`dicts` empty or one entry per column).
+    pub fn eval_predicate_with_dicts(
+        &self,
+        chunk: &Chunk,
+        dicts: &[Option<Arc<DictCodes>>],
+        selection: Option<&[u32]>,
+    ) -> Result<Vec<u32>> {
         if self.root.ty != DataType::Boolean {
             return Err(VetaError::internal("predicate is not BOOLEAN"));
         }
-        self.select(&self.root, chunk, selection)
+        self.select(&self.root, chunk, dicts, selection)
     }
 
-    fn select(&self, e: &Expr, chunk: &Chunk, sel: Option<&[u32]>) -> Result<Vec<u32>> {
+    /// The general evaluation of a predicate leaf, for tests of the in-place paths.
+    #[cfg(test)]
+    fn select_general(&self, chunk: &Chunk, sel: Option<&[u32]>) -> Result<Vec<u32>> {
+        let n = sel.map_or(chunk.len, <[u32]>::len);
+        let d = self.node(&self.root, chunk, sel)?;
+        let positions = true_positions(&d, n)?;
+        Ok(match sel {
+            Some(s) => positions.into_iter().map(|k| s[k as usize]).collect(),
+            None => positions,
+        })
+    }
+
+    /// A leaf predicate over one column evaluated on the selected rows in place; `None`
+    /// when `e` has another shape and takes the general path.
+    fn select_leaf(
+        &self,
+        e: &Expr,
+        chunk: &Chunk,
+        dicts: &[Option<Arc<DictCodes>>],
+        sel: Option<&[u32]>,
+    ) -> Result<Option<Vec<u32>>> {
+        let column = |i: usize| {
+            chunk
+                .columns
+                .get(i)
+                .ok_or_else(|| VetaError::internal(format!("column {i} out of range")))
+        };
+        let dict = |i: usize| dicts.get(i).and_then(Option::as_deref);
+        match &e.node {
+            Node::IsNull { expr, negated } => {
+                let Node::Column(i) = expr.node else {
+                    return Ok(None);
+                };
+                let v = column(i)?;
+                Ok(Some(filter_rows(chunk.len, sel, |r| {
+                    v.is_valid(r) == *negated
+                })))
+            }
+            Node::Like {
+                expr,
+                pattern: LikeArg::Const(Some(p)),
+                negated,
+            } => {
+                let Node::Column(i) = expr.node else {
+                    return Ok(None);
+                };
+                let v = column(i)?;
+                // A whole column without codes searches its buffer at once (`matches_all`).
+                if sel.is_none() && dict(i).is_none() {
+                    return Ok(None);
+                }
+                let negated = *negated;
+                string_rows(
+                    v,
+                    dict(i),
+                    sel,
+                    |offsets, bytes| {
+                        let mut hits = p.matches_all(offsets, bytes);
+                        if negated {
+                            hits.iter_mut().for_each(|h| *h = !*h);
+                        }
+                        hits
+                    },
+                    |s| p.matches(s) != negated,
+                )
+                .map(Some)
+            }
+            Node::Binary { op, left, right } if is_comparison(*op) && left.ty == right.ty => {
+                let (i, value, op) = match (&left.node, &right.node) {
+                    (Node::Column(i), Node::Literal(v)) => (*i, v, *op),
+                    (Node::Literal(v), Node::Column(i)) => (*i, v, flipped(*op)),
+                    _ => return Ok(None),
+                };
+                let v = column(i)?;
+                let validity = v.validity.as_ref();
+                Ok(match (&v.data, value) {
+                    (VectorData::Varchar { .. }, Value::Varchar(lit)) => Some(string_rows(
+                        v,
+                        dict(i),
+                        sel,
+                        |offsets, bytes| {
+                            offsets
+                                .windows(2)
+                                .map(|w| {
+                                    let s = &bytes[w[0] as usize..w[1] as usize];
+                                    satisfies(op, s.cmp(lit.as_slice()))
+                                })
+                                .collect()
+                        },
+                        |s| satisfies(op, s.cmp(lit.as_slice())),
+                    )?),
+                    (VectorData::Int16(x), Value::Int16(c)) => {
+                        Some(compare_rows(x, validity, *c, op, sel, |a: i16, b| {
+                            a.cmp(&b)
+                        }))
+                    }
+                    (VectorData::Int32(x), Value::Int32(c))
+                    | (VectorData::Date(x), Value::Date(c)) => {
+                        Some(compare_rows(x, validity, *c, op, sel, |a: i32, b| {
+                            a.cmp(&b)
+                        }))
+                    }
+                    (VectorData::Int64(x), Value::Int64(c))
+                    | (VectorData::Timestamp(x), Value::Timestamp(c)) => {
+                        Some(compare_rows(x, validity, *c, op, sel, |a: i64, b| {
+                            a.cmp(&b)
+                        }))
+                    }
+                    (VectorData::Float64(x), Value::Float64(c)) => {
+                        Some(compare_rows(x, validity, *c, op, sel, cmp_f64))
+                    }
+                    _ => None,
+                })
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn select(
+        &self,
+        e: &Expr,
+        chunk: &Chunk,
+        dicts: &[Option<Arc<DictCodes>>],
+        sel: Option<&[u32]>,
+    ) -> Result<Vec<u32>> {
         match &e.node {
             Node::Binary {
                 op: BinaryOp::And,
                 left,
                 right,
             } => {
-                let first = self.select(left, chunk, sel)?;
+                let first = self.select(left, chunk, dicts, sel)?;
                 if first.is_empty() {
                     return Ok(first);
                 }
-                self.select(right, chunk, Some(&first))
+                self.select(right, chunk, dicts, Some(&first))
             }
             Node::Binary {
                 op: BinaryOp::Or,
@@ -1107,7 +1512,7 @@ impl CompiledExpr {
                     Some(s) => Cow::Borrowed(s),
                     None => Cow::Owned((0..chunk.len as u32).collect()),
                 };
-                let first = self.select(left, chunk, Some(&rows))?;
+                let first = self.select(left, chunk, dicts, Some(&rows))?;
                 let mut rest = Vec::with_capacity(rows.len() - first.len());
                 let mut k = 0;
                 for &r in rows.iter() {
@@ -1120,7 +1525,7 @@ impl CompiledExpr {
                 if rest.is_empty() {
                     return Ok(first);
                 }
-                let second = self.select(right, chunk, Some(&rest))?;
+                let second = self.select(right, chunk, dicts, Some(&rest))?;
                 let (mut i, mut j) = (0, 0);
                 let mut out = Vec::with_capacity(first.len() + second.len());
                 for &r in rows.iter() {
@@ -1135,6 +1540,9 @@ impl CompiledExpr {
                 Ok(out)
             }
             _ => {
+                if let Some(rows) = self.select_leaf(e, chunk, dicts, sel)? {
+                    return Ok(rows);
+                }
                 let n = sel.map_or(chunk.len, <[u32]>::len);
                 let d = self.node(e, chunk, sel)?;
                 let positions = true_positions(&d, n)?;

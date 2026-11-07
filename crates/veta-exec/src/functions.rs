@@ -220,6 +220,20 @@ pub fn substring(s: &Vector, from: IntArg<'_>, length: Option<IntArg<'_>>) -> Re
     Vector::new(out.finish(), validity)
 }
 
+thread_local! {
+    /// Scratch space of the regex machine, reused by every batch a worker evaluates.
+    static REGEX_CACHE: std::cell::RefCell<Cache> = std::cell::RefCell::new(Cache::default());
+}
+
+/// Runs `f` with the regex cache of this thread.
+fn with_cache<R>(f: impl FnOnce(&mut Cache) -> R) -> R {
+    REGEX_CACHE.with(|cache| match cache.try_borrow_mut() {
+        Ok(mut cache) => f(&mut cache),
+        // Only a nested evaluation on the same thread gets here; it uses its own cache.
+        Err(_) => f(&mut Cache::default()),
+    })
+}
+
 /// `REGEXP_REPLACE` with a pattern and a replacement compiled once per query.
 #[derive(Debug)]
 pub struct RegexpReplace {
@@ -239,16 +253,18 @@ impl RegexpReplace {
         let VectorData::Varchar { offsets, bytes } = &v.data else {
             return Err(type_error("regexp_replace", v));
         };
-        let mut cache = Cache::default();
         let mut out = StringBuilder::with_capacity(v.len(), bytes.len());
-        for (i, w) in offsets.windows(2).enumerate() {
-            if v.is_valid(i) {
-                let row = &bytes[w[0] as usize..w[1] as usize];
-                self.regex
-                    .replace_all_into(row, &self.replacement, out.bytes_mut(), &mut cache);
+        with_cache(|cache| -> Result<()> {
+            for (i, w) in offsets.windows(2).enumerate() {
+                if v.is_valid(i) {
+                    let row = &bytes[w[0] as usize..w[1] as usize];
+                    self.regex
+                        .replace_all_into(row, &self.replacement, out.bytes_mut(), cache);
+                }
+                out.finish_row()?;
             }
-            out.finish_row()?;
-        }
+            Ok(())
+        })?;
         Vector::new(out.finish(), v.validity.clone())
     }
 

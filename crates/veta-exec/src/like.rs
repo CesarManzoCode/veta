@@ -9,15 +9,52 @@
 
 use veta_core::{Result, VetaError};
 
-/// Substring search (Horspool) for a needle fixed per query.
+/// How [`Finder::find`] scans for candidates, chosen once when the finder is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    /// Horspool only (CPUs other than x86-64; on x86-64 only the tests build it).
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    Scalar,
+    /// 16 positions at a time on the first and last byte of the needle (SSE2, always
+    /// present on x86-64).
+    Sse2,
+    /// 32 positions at a time (AVX2, detected at run time).
+    Avx2,
+}
+
+impl Scan {
+    /// The widest scan this CPU runs.
+    fn detect() -> Scan {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return Scan::Avx2;
+            }
+            Scan::Sse2
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Scan::Scalar
+        }
+    }
+}
+
+/// Substring search for a needle fixed per query: a SIMD scan that compares the first and
+/// the last byte of the needle at 16 or 32 positions at once and checks the middle bytes
+/// only where both match, with Horspool for the tail and on CPUs without SIMD.
 #[derive(Debug, Clone)]
 pub struct Finder {
     needle: Vec<u8>,
     skip: Box<[usize; 256]>,
+    scan: Scan,
 }
 
 impl Finder {
     pub fn new(needle: Vec<u8>) -> Finder {
+        Finder::with_scan(needle, Scan::detect())
+    }
+
+    fn with_scan(needle: Vec<u8>, scan: Scan) -> Finder {
         let m = needle.len();
         let mut skip = Box::new([m.max(1); 256]);
         if m > 1 {
@@ -25,7 +62,7 @@ impl Finder {
                 skip[b as usize] = m - 1 - i;
             }
         }
-        Finder { needle, skip }
+        Finder { needle, skip, scan }
     }
 
     pub fn needle(&self) -> &[u8] {
@@ -36,17 +73,42 @@ impl Finder {
     #[inline]
     pub fn find(&self, hay: &[u8]) -> Option<usize> {
         let m = self.needle.len();
-        match m {
-            0 => return Some(0),
-            1 => return hay.iter().position(|&b| b == self.needle[0]),
-            _ => {}
+        if m == 0 {
+            return Some(0);
         }
         if hay.len() < m {
             return None;
         }
+        match self.scan {
+            Scan::Scalar => self.horspool(hay, 0),
+            #[cfg(target_arch = "x86_64")]
+            Scan::Sse2 => {
+                // SAFETY: SSE2 is part of the x86-64 baseline.
+                unsafe { simd::find_sse2(self, hay) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            Scan::Avx2 => {
+                // SAFETY: `Scan::Avx2` is only chosen when the CPU reports AVX2.
+                unsafe { simd::find_avx2(self, hay) }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            _ => self.horspool(hay, 0),
+        }
+    }
+
+    /// First occurrence at a position `≥ from`, by Horspool.
+    #[inline]
+    fn horspool(&self, hay: &[u8], from: usize) -> Option<usize> {
+        let m = self.needle.len();
+        if m == 1 {
+            return hay[from..]
+                .iter()
+                .position(|&b| b == self.needle[0])
+                .map(|p| p + from);
+        }
         let last = m - 1;
         let tail = self.needle[last];
-        let mut i = 0;
+        let mut i = from;
         while i + m <= hay.len() {
             let c = hay[i + last];
             if c == tail && hay[i..i + last] == self.needle[..last] {
@@ -55,6 +117,103 @@ impl Finder {
             i += self.skip[c as usize];
         }
         None
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod simd {
+    use std::arch::x86_64::*;
+
+    use super::Finder;
+
+    /// Whether the middle of the needle (between its first and last byte) is at `at`.
+    #[inline(always)]
+    fn middle_matches(hay: &[u8], at: usize, needle: &[u8]) -> bool {
+        let m = needle.len();
+        m <= 2 || hay[at + 1..at + m - 1] == needle[1..m - 1]
+    }
+
+    /// SSE2 scan; every position below the returned one (or below the tail handed to
+    /// Horspool) was checked, so the result is the first occurrence.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support SSE2 (always true on x86-64).
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn find_sse2(finder: &Finder, hay: &[u8]) -> Option<usize> {
+        let needle = finder.needle.as_slice();
+        let m = needle.len();
+        let first = _mm_set1_epi8(needle[0] as i8);
+        let last = _mm_set1_epi8(needle[m - 1] as i8);
+        let mut i = 0;
+        while i + m + 15 <= hay.len() {
+            // SAFETY: `i + 15 < hay.len()` and `i + m - 1 + 15 < hay.len()` by the loop
+            // condition, so both unaligned 16-byte loads stay inside `hay`.
+            let (a, b) = unsafe {
+                (
+                    _mm_loadu_si128(hay.as_ptr().add(i) as *const __m128i),
+                    _mm_loadu_si128(hay.as_ptr().add(i + m - 1) as *const __m128i),
+                )
+            };
+            let eq = _mm_and_si128(_mm_cmpeq_epi8(a, first), _mm_cmpeq_epi8(b, last));
+            let mut mask = _mm_movemask_epi8(eq) as u32;
+            while mask != 0 {
+                let at = i + mask.trailing_zeros() as usize;
+                if middle_matches(hay, at, needle) {
+                    return Some(at);
+                }
+                mask &= mask - 1;
+            }
+            i += 16;
+        }
+        finder.horspool(hay, i)
+    }
+
+    /// AVX2 scan, as [`find_sse2`] with 32 positions per step.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn find_avx2(finder: &Finder, hay: &[u8]) -> Option<usize> {
+        let needle = finder.needle.as_slice();
+        let m = needle.len();
+        let first = _mm256_set1_epi8(needle[0] as i8);
+        let last = _mm256_set1_epi8(needle[m - 1] as i8);
+        let mut i = 0;
+        while i + m + 31 <= hay.len() {
+            // SAFETY: `i + 31 < hay.len()` and `i + m - 1 + 31 < hay.len()` by the loop
+            // condition, so both unaligned 32-byte loads stay inside `hay`.
+            let (a, b) = unsafe {
+                (
+                    _mm256_loadu_si256(hay.as_ptr().add(i) as *const __m256i),
+                    _mm256_loadu_si256(hay.as_ptr().add(i + m - 1) as *const __m256i),
+                )
+            };
+            let eq = _mm256_and_si256(_mm256_cmpeq_epi8(a, first), _mm256_cmpeq_epi8(b, last));
+            let mut mask = _mm256_movemask_epi8(eq) as u32;
+            while mask != 0 {
+                let at = i + mask.trailing_zeros() as usize;
+                if middle_matches(hay, at, needle) {
+                    return Some(at);
+                }
+                mask &= mask - 1;
+            }
+            i += 32;
+        }
+        // SAFETY: SSE2 is part of the x86-64 baseline.
+        unsafe { find_sse2_from(finder, hay, i) }
+    }
+
+    /// The SSE2 scan from position `from` on.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support SSE2.
+    #[target_feature(enable = "sse2")]
+    unsafe fn find_sse2_from(finder: &Finder, hay: &[u8], from: usize) -> Option<usize> {
+        // SAFETY: same requirement as this function.
+        unsafe { find_sse2(finder, &hay[from..]) }.map(|p| p + from)
     }
 }
 
@@ -224,6 +383,17 @@ impl LikePattern {
         Ok(LikePattern { kind })
     }
 
+    /// Relative cost of matching one string, to order the conjuncts of a filter.
+    pub fn cost(&self) -> u32 {
+        match &self.kind {
+            Kind::Any => 1,
+            Kind::Exact(_) | Kind::Prefix(_) | Kind::Suffix(_) => 8,
+            Kind::Contains(_) => 16,
+            Kind::Segments { middle, .. } => 16 + 8 * middle.len() as u32,
+            Kind::General(_) => 48,
+        }
+    }
+
     /// Whether `s` matches the pattern.
     pub fn matches(&self, s: &[u8]) -> bool {
         match &self.kind {
@@ -325,6 +495,59 @@ mod tests {
         assert_eq!(f.find(b"gooooglegoogle"), Some(8));
         assert_eq!(Finder::new(b"a".to_vec()).find(b"bba"), Some(2));
         assert_eq!(Finder::new(Vec::new()).find(b"x"), Some(0));
+    }
+
+    /// Every scan this CPU can run.
+    fn scans() -> Vec<Scan> {
+        let mut scans = vec![Scan::Scalar];
+        #[cfg(target_arch = "x86_64")]
+        {
+            scans.push(Scan::Sse2);
+            if std::arch::is_x86_feature_detected!("avx2") {
+                scans.push(Scan::Avx2);
+            }
+        }
+        scans
+    }
+
+    #[test]
+    fn simd_search_matches_the_naive_search_on_random_text() {
+        use veta_core::rand::Rng;
+        let naive = |hay: &[u8], needle: &[u8]| -> Option<usize> {
+            if needle.is_empty() {
+                return Some(0);
+            }
+            hay.windows(needle.len()).position(|w| w == needle)
+        };
+        let mut rng = Rng::new(17);
+        for round in 0..3000 {
+            // A small alphabet makes partial matches of the first and last byte frequent.
+            let alphabet = if round % 2 == 0 { 3 } else { 26 };
+            let hay_len = rng.below(200) as usize;
+            let hay: Vec<u8> = (0..hay_len)
+                .map(|_| b'a' + rng.below(alphabet) as u8)
+                .collect();
+            let needle_len = rng.below(12) as usize;
+            let needle: Vec<u8> = if needle_len > 0 && hay_len >= needle_len && rng.next_bool(0.5) {
+                let at = rng.below((hay_len - needle_len + 1) as u64) as usize;
+                hay[at..at + needle_len].to_vec()
+            } else {
+                (0..needle_len)
+                    .map(|_| b'a' + rng.below(alphabet) as u8)
+                    .collect()
+            };
+            let expected = naive(&hay, &needle);
+            for scan in scans() {
+                let finder = Finder::with_scan(needle.clone(), scan);
+                assert_eq!(
+                    finder.find(&hay),
+                    expected,
+                    "{scan:?} {:?} in {:?}",
+                    String::from_utf8_lossy(&needle),
+                    String::from_utf8_lossy(&hay)
+                );
+            }
+        }
     }
 
     #[test]
