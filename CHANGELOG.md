@@ -2,19 +2,24 @@
 
 ## Sin publicar
 
-### K4 — rendimiento, memoria, multihilo, mutantes y verificación total (sin fecha de cierre)
+### K4 — rendimiento contra las referencias, memoria, multihilo y catálogo de mutantes (2026-11-07)
 
-Nada de esta entrada está medido todavía: ningún mini sprint compiló, corrió ni midió su código. Las mejoras de velocidad son hipótesis, y las cifras y los veredictos llegan con la verificación de cierre del K.
-
-- Ejecutor más rápido (hipótesis de diseño): agrupación por índice directo cuando las estadísticas acotan una clave entera, agrupación por código de diccionario en cadenas, filtros evaluados una vez por entrada de diccionario, materialización tardía en top-N, conjunciones evaluadas de la más barata a la más cara, `LIKE '%lit%'` con SSE2/AVX2 y prefiltro de prefijo literal en expresiones regulares. Cada cambio tiene un test de equivalencia contra el camino general.
-- Arnés de rendimiento: `perf clickbench|tpch` (3 corridas por consulta en los tres motores, `runs/perf-<b>/times.csv` y razones por consulta y media geométrica frente a cada referencia), `rss` (tope de memoria de las 65 consultas con `/usr/bin/time -f %M`) y `threads` (ClickBench con `--threads 1` frente a `--threads 12`).
-- Catálogo de mutantes de §18: seis features de Cargo apagadas por omisión (`mutant-prune-extra-granule` y `mutant-prune-wrong-bound` en veta-storage; `mutant-pushdown-outer`, `mutant-reorder-outer` y `mutant-estimate-ignore-null` en veta-sql; `mutant-codec-drop-last-block` en veta-codec), reexportadas por veta-cli. Cada pieza que rompen tiene además un test normal que fallaría con el mutante activo.
-- Arnés: `mutants` compila cada mutante en `target/mutants/<nombre>`, corre con él los siete comandos de §18 e imprime `MUTANT mutant-<nombre> KILLED by <comandos>` o `MUTANT mutant-<nombre> SURVIVED`, con el nombre del catálogo de §18 (el mismo que va en el campo `mutant` de cada item); `all` corre en orden los comandos de §17 y pasa si cada uno es PASS o SKIP.
+- veta cumple los umbrales de tiempo de §16 contra ClickHouse 26.8.34.13 y DuckDB 2.0.0. Verificado con `perf clickbench` (43 consultas, 10 M filas) y `perf tpch` (22 consultas, SF10): con el mejor de 3 corridas, cada cociente `(t_veta + 0.01) / (t_ref + 0.01)` es ≤ 15 y la media geométrica ≤ 4, contra cada referencia por separado.
+- Ninguna de las 65 consultas pasa de 10 GiB de memoria residente. Verificado con `rss` (`/usr/bin/time -f %M`).
+- La ejecución con 12 hilos es al menos 3 veces más rápida que con 1 en la suma de ClickBench. Verificado con `threads`.
+- Ejecutor más rápido, con los mismos resultados: agrupación por índice directo cuando las estadísticas acotan una clave entera; filtros y `GROUP BY` sobre cadenas con diccionario evaluados por entrada de diccionario y agrupados por código; top-N con materialización tardía (primero las columnas de filtro y de orden, después el resto solo en los gránulos ganadores); conjunciones de la más barata a la más cara; `LIKE '%lit%'` con SSE2/AVX2 elegido en tiempo de ejecución; prefiltro por prefijo literal en expresiones regulares; y build de hash join en un solo bloque reservado. Cada cambio tiene un test de equivalencia contra el camino general.
+- Catálogo de mutantes de §18: seis fallas plantadas como features de Cargo apagadas por omisión (`mutant-prune-extra-granule`, `mutant-prune-wrong-bound`, `mutant-pushdown-outer`, `mutant-reorder-outer`, `mutant-estimate-ignore-null` y `mutant-codec-drop-last-block`). Verificado con `mutants`: los seis mueren, y el binario normal no incluye ninguna.
+- Verificación total: `python3 -m harness all` corre en orden los 30 comandos de §17. Verificado: los 30 en PASS, ninguno en SKIP.
+- Arnés: `perf clickbench|tpch` (escribe `runs/perf-<b>/times.csv` y los cocientes por consulta y la media geométrica frente a cada referencia), `rss`, `threads`, `mutants` y `all`.
+- Los criterios de K1, K2 y K3 siguen pasando sobre el código de K4, incluido ClickBench contra los dos oráculos, TPC-H SF1 y SF10, `tlp`, `optimizer-oracle`, los cortes con `kill -9` y Parquet. `make check`: 667 tests de Rust y 300 del arnés, 0 fallos.
+- Decisión: el ejecutor no verifica los bloques que deja de leer (el resto de un gránulo sin filas tras el primer filtro y las columnas de los gránulos que el top-N tardío descarta), igual que con la poda: §6.4 verifica los bloques que una consulta lee.
+- Decisión: en el top-N, las filas empatadas conservan el orden de entrada.
+- Decisión: cada corrida de un motor en `perf`, `rss` y `threads` tiene un tope de 1800 s, para que un proceso colgado no detenga el comando.
 - Decisión: para `mutants`, un comando mata al mutante si termina con 1 (FAIL). Un 2 (error de infraestructura) hace que `mutants` termine con 2, porque su veredicto no es fiable. Sin `bin/duckdb`, `mutants` es SKIP.
-- Decisión: `mutants` guarda las corridas con mutante en `runs/mutants/<nombre>/<comando>/` y restaura los `runs/<comando>/` que existían antes. Así, después de `all`, los reportes de los comandos siguen siendo los del binario sin mutar.
+- Decisión: `mutants` imprime cada mutante con su nombre del catálogo (`MUTANT mutant-<nombre> KILLED by <comandos>`) y compila en `target/mutants/<nombre>` con el nombre corto. Guarda las corridas con mutante en `runs/mutants/<nombre>/<comando>/` y restaura los `runs/<comando>/` que existían antes, así que después de `all` los reportes siguen siendo los del binario sin mutar.
 - Decisión: `mutants` y `all` muestran la salida de cada subcomando con el prefijo `<comando>| ` y la guardan entera en `runs/<driver>/logs/`. Así la única línea que empieza con `RESULT` es la del propio driver.
 
-### K3 — fusión, recuperación, escritura Parquet y comandos de durabilidad, Parquet y compresión (sin fecha de cierre)
+### K3 — fusiones, recuperación tras cortes, detección de corrupción, escritura Parquet y compresión (2026-11-07)
 
 - Las tablas se fusionan: `veta merge [--final]` en primer plano y `veta merger` en segundo plano, con fusión vertical y la política de ventanas de §7. Fusionar no cambia los resultados. Verificado con `merge-equivalence`: las 43 consultas de ClickBench dan lo mismo con `hits` en 100 partes y en una sola parte fusionada.
 - Las consultas leen durante las fusiones sin diferencias ni errores. Verificado con `concurrent-reader`: ≥ 200 iteraciones con `merger` corriendo, y el número de partes activas bajó.

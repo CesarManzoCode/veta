@@ -12,9 +12,25 @@ Lo que el proyecto no demuestra está en [LIMITATIONS.md](LIMITATIONS.md).
 | K1 | Almacenamiento, códecs, lectura Parquet, SQL de una tabla y ClickBench igual a ClickHouse y DuckDB | Cerrada |
 | K2 | Subconsultas, joins, optimizador con cardinalidad, TPC-H y oráculos TLP y encendido/apagado | Cerrada |
 | K3 | Fusiones, recuperación tras cortes, detección de corrupción, escritura Parquet y compresión | Cerrada |
-| K4 | Rendimiento contra las referencias, memoria, multihilo y catálogo de mutantes | Pendiente |
+| K4 | Rendimiento contra las referencias, memoria, multihilo y catálogo de mutantes | Cerrada |
 
 ## Resultados
+
+### Cierre de K4 (2026-11-07)
+
+Los veredictos son de la verificación de cierre sobre `fe51f8c`. Esa corrida solo registró si cada comando cumple su umbral, no sus cifras: no se publica ningún cociente, RSS ni factor de aceleración medido. La columna «Medido» dice qué umbral quedó cumplido.
+
+| Comando | Veredicto | Medido |
+|---|---|---|
+| `perf clickbench` | PASS | las 43 consultas en veta, ClickHouse y DuckDB, mejor de 3: cada cociente `(t_veta + 0.01) / (t_ref + 0.01)` ≤ 15 y media geométrica ≤ 4, contra ClickHouse y contra DuckDB por separado (recalculados por el checker desde `times.csv`) |
+| `perf tpch` | PASS | lo mismo con las 22 consultas de TPC-H SF10 |
+| `rss` | PASS | RSS máximo de cada una de las 65 consultas (43 + 22 SF10) ≤ 10 485 760 KB (10 GiB) |
+| `threads` | PASS | `T(--threads 1) / T(--threads 12)` ≥ 3.0 sobre la suma de ClickBench |
+| `mutants` | PASS | los 6 mutantes de §18 mueren; ninguna feature `mutant-*` está en las features por omisión |
+| `all` | PASS | cada comando de §17 en PASS, ninguno en SKIP |
+| `make check` | PASS | 667 tests de Rust y 300 del arnés, 0 fallos |
+
+En ese mismo cierre siguen pasando los criterios de K1 (9), K2 (6) y K3 (13) con sus propios checkers.
 
 ### Cierre de K3 (2026-11-07)
 
@@ -68,7 +84,7 @@ Medidos en la máquina del proyecto (Ryzen 5 5600G, 14 GiB visibles):
 | `size` | PASS: el arnés tiene menos líneas que el motor |
 | `make check` | 472 tests de Rust y 106 del arnés, 0 fallos |
 
-Aparte del factor de `join-reorder`, que compara a veta consigo mismo, y de la velocidad de descompresión de `vlz` (K3), todavía no hay resultados de tiempo de consulta, memoria ni multihilo de veta (K4). La línea base de las referencias está en `vault/RESEARCH.md` §5.
+La línea base de las referencias está en `vault/RESEARCH.md` §5.
 
 ## Uso
 
