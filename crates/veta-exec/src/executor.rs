@@ -861,8 +861,22 @@ mod tests {
                     &ctx,
                 )
                 .unwrap();
-                assert_eq!(rows_of(&two_pass.chunks), expected, "{limited}, {threads}");
-                assert_eq!(rows_of(&one_pass.chunks), expected, "{limited}, {threads}");
+                // The TopN node also outputs the sort keys missing from the SELECT list,
+                // after the selected columns; the projection above it drops them.
+                let selected = |rows: Vec<Vec<Value>>| -> Vec<Vec<Value>> {
+                    let width = expected.first().map_or(0, Vec::len);
+                    rows.into_iter().map(|r| r[..width].to_vec()).collect()
+                };
+                assert_eq!(
+                    selected(rows_of(&two_pass.chunks)),
+                    expected,
+                    "{limited}, {threads}"
+                );
+                assert_eq!(
+                    selected(rows_of(&one_pass.chunks)),
+                    expected,
+                    "{limited}, {threads}"
+                );
                 assert_eq!(
                     optimized_query(&db, &limited, threads, true).unwrap(),
                     expected,
@@ -920,9 +934,8 @@ mod tests {
             .map(|(k, c)| vec![k, Value::Int64(c)])
             .collect();
         // NULLS LAST in ascending order.
-        expected.rotate_left(usize::from(
-            expected.first().is_some_and(|r| r[0].is_null()),
-        ));
+        let null_first = usize::from(expected.first().is_some_and(|r| r[0].is_null()));
+        expected.rotate_left(null_first);
         assert_eq!(
             optimized_query(
                 &db,

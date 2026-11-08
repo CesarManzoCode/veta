@@ -94,8 +94,8 @@ class MutantsTest(unittest.TestCase):
         items, infra, out = self.run_simulated(codes)
         self.assertEqual(infra, [])
         self.assertEqual(mutants.mutant_verdict(items), (PASS, "6/6 killed"))
-        self.assertIn("MUTANT codec-drop-last-block KILLED by codec-roundtrip,tlp", out)
-        self.assertEqual(items[0], {"mutant": "prune-extra-granule", "killed": True, "by": ["tlp"]})
+        self.assertIn("MUTANT mutant-codec-drop-last-block KILLED by codec-roundtrip,tlp", out)
+        self.assertEqual(items[0], {"mutant": "mutant-prune-extra-granule", "killed": True, "by": ["tlp"]})
 
     def test_one_survivor_fails(self):
         codes = {(m, "pruning"): 1 for m, _ in mutants.MUTANTS if m != "reorder-outer"}
@@ -104,10 +104,10 @@ class MutantsTest(unittest.TestCase):
         items, infra, out = self.run_simulated(codes)
         status, summary = mutants.mutant_verdict(items)
         self.assertEqual(status, FAIL)
-        self.assertEqual(summary, "5/6 killed; survived: reorder-outer")
-        self.assertIn("MUTANT reorder-outer SURVIVED", out)
-        survivor = [i for i in items if i["mutant"] == "reorder-outer"][0]
-        self.assertEqual(survivor, {"mutant": "reorder-outer", "killed": False, "by": []})
+        self.assertEqual(summary, "5/6 killed; survived: mutant-reorder-outer")
+        self.assertIn("MUTANT mutant-reorder-outer SURVIVED", out)
+        survivor = [i for i in items if i["mutant"] == "mutant-reorder-outer"][0]
+        self.assertEqual(survivor, {"mutant": "mutant-reorder-outer", "killed": False, "by": []})
 
     def test_exit_2_is_reported_as_infrastructure(self):
         codes = {(m, "tlp"): 1 for m, _ in mutants.MUTANTS}

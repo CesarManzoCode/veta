@@ -25,7 +25,9 @@ from pathlib import Path
 from harness.config import Paths
 from harness.report import EXIT_CODES, EXIT_USAGE, FAIL, PASS, SKIP, Infra, Report, Skip
 
-# The catalog of §18: feature name without `mutant-`, and the crate that holds it.
+# The catalog of §18: feature name without `mutant-`, and the crate that holds it. Items and
+# MUTANT lines name each mutant by its full catalog name (`mutant-<name>`); the build and
+# report directories use the short name, as `target/mutants/<name>` in §18.
 MUTANTS = (
     ("prune-extra-granule", "veta-storage"),
     ("prune-wrong-bound", "veta-storage"),
@@ -163,7 +165,7 @@ def run_mutants(build, run_command, report: Report) -> list[str]:
                 by.append(name)
             elif code == EXIT_USAGE:
                 infra.append(f"{mutant}:{name}")
-        item = report.add({"mutant": mutant, "killed": bool(by), "by": by})
+        item = report.add({"mutant": feature(mutant), "killed": bool(by), "by": by})
         print(mutant_line(item), flush=True)
     return infra
 
