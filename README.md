@@ -11,10 +11,31 @@ Lo que el proyecto no demuestra está en [LIMITATIONS.md](LIMITATIONS.md).
 | K0 | Fundación: contrato, investigación con fuentes fijadas, plan y comando de chequeo | Cerrada |
 | K1 | Almacenamiento, códecs, lectura Parquet, SQL de una tabla y ClickBench igual a ClickHouse y DuckDB | Cerrada |
 | K2 | Subconsultas, joins, optimizador con cardinalidad, TPC-H y oráculos TLP y encendido/apagado | Cerrada |
-| K3 | Fusiones, recuperación tras cortes, detección de corrupción, escritura Parquet y compresión | Pendiente |
+| K3 | Fusiones, recuperación tras cortes, detección de corrupción, escritura Parquet y compresión | Cerrada |
 | K4 | Rendimiento contra las referencias, memoria, multihilo y catálogo de mutantes | Pendiente |
 
 ## Resultados
+
+### Cierre de K3 (2026-11-07)
+
+Los veredictos son de la verificación de cierre. Las cifras de `compressor` y de `make check` son de la corrida anterior sobre el mismo árbol (`02c6d83`). Para los demás comandos solo se registró que cumplen el umbral de la columna «Medido».
+
+| Comando | Veredicto | Medido |
+|---|---|---|
+| `merge-equivalence` | PASS | `hits` en 100 partes y después de `merge --final`: 43/43 resultados iguales y una sola parte activa |
+| `concurrent-reader` | PASS | ≥ 200 iteraciones con `merger` corriendo, sin diferencias ni errores, y menos partes activas al final que al principio |
+| `crash-merge` | PASS | ≥ 100 iteraciones de `kill -9` durante `merge --final`, todas correctas tras `recover`, sin `tmp_*`, con ≥ 80 % de cortes con el proceso vivo |
+| `crash-insert` | PASS | ≥ 100 iteraciones de `kill -9` durante `load`, ningún lote a medias, con ≥ 80 % de cortes con el proceso vivo |
+| `corruption` | PASS | un byte cambiado en cada uno de los 7 tipos de archivo de una parte: la parte queda en `detached/` |
+| `parquet-read-duckdb` | PASS | archivos de DuckDB y de parquet-testing con PLAIN, PLAIN_DICTIONARY, RLE_DICTIONARY, RLE, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY y BYTE_STREAM_SPLIT, sin comprimir y Snappy, leídos igual que DuckDB |
+| `parquet-read-hits` | PASS | los 10 `hits_N.parquet` dan los mismos conteos y sumas que DuckDB |
+| `parquet-write-duckdb` | PASS | lo que escribe `veta export` de `hits` y de las 8 tablas de TPC-H SF1 lo lee DuckDB sin diferencias (`EXCEPT ALL` en ambos sentidos) |
+| `parquet-write-clickhouse` | PASS | los mismos archivos, leídos por ClickHouse sin diferencias |
+| `parquet-stats` | PASS | mín, máx y conteo de NULL de cada column chunk iguales a los que lee y calcula DuckDB |
+| `parquet-rowgroup-skip` | PASS | en las 5 consultas sobre `lineitem` SF1 ordenado por `l_shipdate` se leen menos grupos de filas que el total, con el mismo resultado que sin poda |
+| `disk-bytes` | PASS | `hits` de veta en una parte ocupa ≤ 1.10 × lo que ocupa en ClickHouse |
+| `compressor` | PASS | ratio agregado de `vlz` 6.509 contra 5.008 de `lz4 -b1` (umbral ≥ 1.0×); descompresión agregada 4091.855 MB/s contra 5523.429 MB/s, 0.74× (umbral ≥ 0.33×) |
+| `make check` | PASS | todos los tests de Rust y 266 del arnés, 0 fallos |
 
 ### Cierre de K2 (2026-11-06)
 
@@ -47,7 +68,7 @@ Medidos en la máquina del proyecto (Ryzen 5 5600G, 14 GiB visibles):
 | `size` | PASS: el arnés tiene menos líneas que el motor |
 | `make check` | 472 tests de Rust y 106 del arnés, 0 fallos |
 
-Aparte del factor de `join-reorder`, que compara a veta consigo mismo, todavía no hay resultados de tiempo, memoria ni multihilo de veta (K4). La línea base de las referencias está en `vault/RESEARCH.md` §5.
+Aparte del factor de `join-reorder`, que compara a veta consigo mismo, y de la velocidad de descompresión de `vlz` (K3), todavía no hay resultados de tiempo de consulta, memoria ni multihilo de veta (K4). La línea base de las referencias está en `vault/RESEARCH.md` §5.
 
 ## Uso
 

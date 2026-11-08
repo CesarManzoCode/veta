@@ -2,19 +2,25 @@
 
 ## Sin publicar
 
-### K3 — fusión, recuperación, escritura Parquet y comandos de durabilidad, Parquet y compresión (sin fecha de cierre)
+### K3 — fusiones, recuperación tras cortes, detección de corrupción, escritura Parquet y compresión (2026-11-07)
 
-Nada de esta entrada está medido todavía: los comandos existen y tienen tests con datos sintéticos, pero ninguno se corrió contra el binario real en sus mini sprints. Las cifras y los veredictos llegan con la verificación de cierre del K.
-
-- Fusión vertical y política de ventanas de §7: `veta merge [--final]` y el fusionador en segundo plano `veta merger`.
-- Recuperación y detección de corrupción: `veta check` verifica cada bloque de cada parte, separa las corruptas en `detached/` y termina con 3; las lecturas, `dump-columns` y `codec-roundtrip --db` hacen lo mismo con una parte rota.
-- Escritura Parquet propia: `veta export` con `--encoding plain|dict|delta|delta-byte-array`, `--compression none|snappy`, `--page-version 1|2` y `--row-group-rows`, con estadísticas exactas por column chunk. `veta parquet-meta` imprime el pie en TSV.
-- Arnés de durabilidad: `merge-equivalence`, `concurrent-reader`, `crash-merge`, `crash-insert` y `corruption`.
-- Arnés de Parquet (`parquet_interop.py`): `parquet-read-duckdb` (archivos de DuckDB en v1/v2, con y sin diccionario, sin comprimir y Snappy, con columnas nullable y `DOUBLE`, más los dos de parquet-testing; cobertura de codificaciones por `parquet_metadata`), `parquet-read-hits`, `parquet-write-duckdb` y `parquet-write-clickhouse` (`EXCEPT ALL` en ambos sentidos contra la tabla del oráculo, con cada columna convertida al tipo de esa tabla), `parquet-stats` y `parquet-rowgroup-skip`.
-- Arnés de compresión: `disk-bytes` (`merge --final`, `du -sb` de `hits` frente a `sum(bytes_on_disk)` de ClickHouse) y `compressor` (`vlz` frente a `lz4 -b1 -i3 -q` sobre `dump-columns` de `hits`, con ratio y velocidad de descompresión agregados de §16 y los números crudos por archivo en `report.json`).
+- Las tablas se fusionan: `veta merge [--final]` en primer plano y `veta merger` en segundo plano, con fusión vertical y la política de ventanas de §7. Fusionar no cambia los resultados. Verificado con `merge-equivalence`: las 43 consultas de ClickBench dan lo mismo con `hits` en 100 partes y en una sola parte fusionada.
+- Las consultas leen durante las fusiones sin diferencias ni errores. Verificado con `concurrent-reader`: ≥ 200 iteraciones con `merger` corriendo, y el número de partes activas bajó.
+- Un `kill -9` en medio de una fusión o de una carga no deja la tabla a medias: tras `veta recover` no queda ningún temporal y cada lote está completo o ausente. Verificado con `crash-merge` y `crash-insert`: ≥ 100 cortes cada uno, ≥ 80 % con el proceso todavía vivo.
+- Las partes corruptas se detectan y se separan: `veta check` verifica cada bloque de cada parte, mueve las corruptas a `detached/` y termina con 3. Las consultas, `dump-columns` y `codec-roundtrip --db` hacen lo mismo cuando leen un bloque roto. Verificado con `corruption`: un byte cambiado en cualquiera de los 7 tipos de archivo de una parte la deja en `detached/`.
+- La lectura de Parquet ya está verificada con archivos de DuckDB en todas las configuraciones (páginas v1/v2, con y sin diccionario, sin comprimir y Snappy), con los dos archivos DELTA_BYTE_ARRAY de parquet-testing y con los 10 `hits_N.parquet`. Verificado con `parquet-read-duckdb`, que cubre las 8 codificaciones de §9, y con `parquet-read-hits`.
+- Escritura Parquet propia: `veta export` con `--encoding plain|dict|delta|delta-byte-array`, `--compression none|snappy`, `--page-version 1|2` y `--row-group-rows`, con mín, máx y conteo de NULL exactos por column chunk. `veta parquet-meta` imprime el pie en TSV. Verificado con `parquet-write-duckdb` y `parquet-write-clickhouse`: DuckDB y ClickHouse leen sin diferencias `hits` y las 8 tablas de TPC-H SF1 exportadas. Las estadísticas coinciden con las que lee y calcula DuckDB (`parquet-stats`).
+- `read_parquet` salta los grupos de filas que las estadísticas excluyen. Verificado con `parquet-rowgroup-skip`: en 5 consultas sobre `lineitem` SF1 se leen menos grupos de filas que el total, con el mismo resultado que sin poda.
+- Con `hits` en una sola parte, veta ocupa en disco ≤ 1.10 × lo que ocupa ClickHouse (`disk-bytes`).
+- El compresor `vlz` comprime más que `lz4 -b1` y descomprime a más de un tercio de su velocidad. Verificado con `compressor` sobre las columnas de `hits`: ratio agregado 6.509 contra 5.008 y descompresión agregada 4091.855 MB/s contra 5523.429 MB/s (0.74×).
+- Descompresión de `vlz` más rápida en coincidencias con desplazamiento menor que 16: solo el primer múltiplo del desplazamiento que llega a 16 bytes se copia byte a byte, y el resto en bloques de 16 bytes. Antes se copiaba byte a byte la coincidencia entera. En la columna `CLID`, de ~700 a ~5100 MB/s en `codec-bench`.
+- `make check`: todos los tests de Rust y 266 del arnés, 0 fallos.
+- Las cifras de este K son de la corrida de `check_k3.py` sobre `02c6d83`, el mismo árbol que pasó la verificación de cierre.
+- Decisión: `.insert.lock` se suelta después de bloquear el temporal de la inserción, no antes como dice §6.1, y una fusión no forma ventanas que crucen un bloque con inserción viva. Así dos cargas concurrentes y una fusión no pueden publicar una parte ya cubierta, que perdería sus filas.
+- Decisión: la recuperación borra temporales bajo `.insert.lock` exclusivo, y verifica cada bloque de la parte que cubre antes de borrar las partes cubiertas. Así nunca borra trabajo en curso ni la única copia intacta de unas filas.
+- Decisión: `merge --final` respeta `--merge-memory-mb`, porque §7 solo le quita el puntaje y `--max-merge-rows`. Si las partes no caben, termina con error 1.
 - Decisión: `parquet-read-duckdb` lee muestras y no tablas completas, porque compara multiconjuntos en memoria: 20 000 filas de `hits` (todas sus columnas) y las filas de `lineitem` SF1 con `l_orderkey <= 40000`, escritas en grupos de 10 240 filas.
 - Decisión: `parquet-read-hits` suma las longitudes en bytes, con `length` en veta y `strlen` en DuckDB, porque el `length` de DuckDB cuenta caracteres.
-- Descompresión de `vlz` más rápida en coincidencias de desplazamiento menor que 16: escribe byte a byte solo el primer múltiplo del desplazamiento que llega a 16 y copia el resto en bloques de 16 bytes. Antes toda la coincidencia se copiaba byte a byte.
 - Decisión: `codec-bench` descomprime en un mismo buffer de salida en todas sus corridas (`vlz::decompress_into`, `snappy::decompress_into`), como hace `lz4 -b`. Así mide el decodificador y no los fallos de página de alocar en cada corrida una salida nueva, que en `Title` de `hits` es de 1.1 GB.
 - Decisión: cada comando escribe sus propios archivos en `scratch/<nombre>/`; `parquet-write-duckdb`, `parquet-write-clickhouse` y `parquet-stats` repiten las mismas 66 exportaciones en vez de compartirlas.
 
